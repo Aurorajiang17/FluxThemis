@@ -1,0 +1,27 @@
+# Paths are relative to this YAML file; ~ and ${ENV_VAR} are supported.
+# Use the prepared RoboLab Python for both this launcher and its workers.
+version: 1
+simulator:
+  robolab_root: ../../../RoboLab
+  # python: ../../../RoboLab/.venv/bin/python
+  config: droid.py
+  gpu_ids: [0]  # Override with --gpu-ids for the simulator host's allocation.
+  workers_per_gpu: 1
+  task: BananaInBowlTask  # --full selects all tasks from droid.py.
+  episodes: 1  # --smoke uses one episode per configured simulator worker.
+  cache: ~/.cache/fluxthemis-robolab
+  save_videos: false
+  coordinator_port: 15558  # Next port is reserved for simulator torchrun.
+  episode_timeout_s: 3600
+  simulator_restart_limit: 0  # Restarting would restart native random streams.
+model:
+  host: 127.0.0.1  # Set the already-running FluxVLA server's reachable IP.
+  port: 15555
+  wait_seconds: 1800
+  result_dir: null
+  expected_workers: null
+run:
+  output_root: ../../work_dirs/robolab
+  max_minutes: 0
+# See docs/robolab.md for separate CUDA/render ordinals and deployment checks.
+# Resume and historical multi-environment equivalence need separate validation.

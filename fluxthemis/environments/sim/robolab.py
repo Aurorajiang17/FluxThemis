@@ -205,9 +205,24 @@ class RoboLabEnvironment(BaseEnvironment):
 
     def configure_simulator_device(self, device_id: str) -> None:
         self._require_unstarted()
-        if not str(device_id).isdigit():
-            raise ValueError('device_id must be a non-negative GPU ordinal')
-        self.device_id = int(device_id)
+        token = str(device_id)
+        if not (token.isdecimal()
+                or re.fullmatch(r'GPU-[A-Za-z0-9-]+', token)):
+            raise ValueError('device_id must be a GPU index or UUID')
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        if visible is not None:
+            devices = visible.split(',')
+            if token not in devices or len(set(devices)) != len(devices):
+                raise ValueError('Assigned GPU is not uniquely present in '
+                                 'CUDA_VISIBLE_DEVICES')
+            # The supervisor isolates its assigned physical index/UUID before
+            # this callback. CUDA numbers devices within that visible list.
+            self.device_id = devices.index(token)
+        elif token.isdecimal():
+            self.device_id = int(token)
+        else:
+            raise ValueError('GPU UUID assignment requires '
+                             'CUDA_VISIBLE_DEVICES')
 
     def setup(self) -> None:
         if self._runtime is not None:

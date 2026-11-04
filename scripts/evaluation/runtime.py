@@ -92,6 +92,8 @@ class ProcessRunner:
             self.env['ROBODOJO_ROOT'] = plan['local']['robodojo_root']
         if plan['local'].get('robotwin_root'):
             self.env['ROBOTWIN_ROOT'] = plan['local']['robotwin_root']
+        if plan['local'].get('robolab_root'):
+            self.env['ROBOLAB_ROOT'] = plan['local']['robolab_root']
         if plan['local'].get('cache'):
             self.env['XDG_CACHE_HOME'] = plan['local']['cache']
         self.env.pop('NPROC_PER_NODE', None)

@@ -3,7 +3,10 @@
 `RoboLabEnvironment` connects the official RoboLab DROID joint-position
 environment to the existing Themis `BaseEnvironment` contract. The standalone
 configuration is [`configs/robolab/droid.py`](../configs/robolab/droid.py).
-It selects one task and two development episodes. It does not define model
+It selects all benchmark tasks with one episode per task, following the official
+CLI defaults (`num_envs=1`, `num_runs=1`). Small development selections belong in
+[`remote.yaml`](../configs/robolab/remote.yaml) or runtime overrides.
+It does not define model
 weights, tokenizers, normalization, inference precision or a fixed action chunk
 length. Future policies can use the same environment-unit interface after their
 own input/output recipes have been validated.
@@ -13,10 +16,11 @@ own input/output recipes have been validated.
 The adapter has CPU contract tests and single-worker, fixed-action validation
 against the official RoboLab episode runner. The checked scope includes real
 application startup, same-application task switching, joint ordering, observation
-mapping and native results. The full remote launcher, deployment preflight,
-RoboLab report summary and historical evaluation protocol remain separate
-integration work. This document does not provide a validated full-evaluation
-launch command.
+mapping and native results. The remote YAML/configuration path and static
+deployment preflight have CPU coverage. Real model/worker integration, RoboLab
+report summaries, continuous model-driven episodes and the historical evaluation
+protocol remain separate validation work. The commands below prepare/check a
+deployment; they do not establish a validated full-evaluation protocol.
 
 The source reference is RoboLab commit
 `9cce00cadd5dc575fd2b8ea3836f5bdcde574229`. Its development runtime uses
@@ -69,6 +73,107 @@ and thread limits. Neither a particular GPU number nor machine paths are fixed
 in the Python recipe. A launcher must verify the actual device UUID and renderer
 assignment for its machine; the shared worker's CUDA assignment alone does not
 resolve graphics ordinal differences.
+
+The worker callback accepts the assigned physical GPU index or UUID and maps it
+to its position in `CUDA_VISIBLE_DEVICES`; a worker isolated to one GPU uses
+CUDA 0. An assignment outside that list is rejected. This callback preserves
+the separately configured `render_device_id`. Multi-GPU graphics assignment
+requires separate deployment validation; start with one worker.
+
+## Remote configuration and preflight
+
+The split deployment follows [RoboDojo](robodojo.md): start FluxVLA separately,
+then use Themis to connect to its reachable ZMQ endpoint. The YAML references the
+model-independent DROID Python config; it does not start or replace the model.
+
+| Entry | Task scope | Episodes |
+| --- | --- | --- |
+| `configs/robolab/droid.py` | All benchmark tasks | 1 per task |
+| `configs/robolab/remote.yaml` | BananaInBowlTask | 1 |
+| YAML with `--smoke` | BananaInBowlTask | One per configured simulator worker |
+| YAML with `--full` | All benchmark tasks | Python configuration quotas |
+
+This separation matches RoboDojo and RoboTwin, whose Python recipes describe
+their complete suites and whose remote YAMLs default to one task/one episode.
+Their per-task quotas remain benchmark-specific. RoboLab's one-episode default
+comes from `robolab/eval/runner.py` in the reference revision above, not from the
+historical ten-environment run. `--full` changes scope, not protocol equivalence.
+
+Copy the YAML to a deployment location and adjust `simulator.config`,
+`simulator.robolab_root`, `simulator.python`, `model.host` and `run.output_root`.
+Paths resolve relative to that YAML; `~` and environment variables are supported.
+Root precedence is YAML, Python environment config, `ROBOLAB_ROOT`, then a
+RoboLab checkout beside FluxThemis. An unset referenced variable is an error.
+The interpreter defaults to the launcher interpreter; set `simulator.python`
+explicitly when the launcher and simulation environments differ. Install the
+normal Themis dependencies in that interpreter without changing the model env.
+
+The public template uses `gpu_ids: [0]`, like the other benchmarks. Override it
+with `--gpu-ids` for the host allocation. Set the independent graphics ordinal
+through `--cfg-options themis.evaluation.environment.render_device_id=...` when
+CUDA isolation changes the numbering. Keep host UUIDs, private paths and Kit
+thread/resource limits in deployment overrides. Run under the host's assigned
+CPU affinity and thread limits; the YAML does not allocate or reserve resources.
+
+Resolve a prepared deployment without starting workloads:
+
+```bash
+python scripts/run_evaluation.py --config /path/to/remote.yaml --dry-run
+python scripts/run_evaluation.py --config /path/to/remote.yaml --smoke --dry-run
+python scripts/run_evaluation.py --config /path/to/remote.yaml --full --dry-run
+```
+
+Each call writes `plan.json`, `launch_config.yaml` and `config_snapshot.py` in
+a unique run directory. RoboLab's native files are rooted under that run's
+`native/` directory, then separated by worker and native instance. The snapshot
+records that exact path. Dry-run performs no dependency, asset, network or GPU
+checks and does not create the native output directory.
+
+For an ordered subset, use the Python entry with existing config overrides:
+
+```bash
+python scripts/run_evaluation.py --config configs/robolab/droid.py --dry-run \
+  --cfg-options \
+  'themis.evaluation.environment.task_name=[MustardInRightBinTask,BananaInBowlTask]' \
+  themis.evaluation.episodes_per_task=2
+```
+
+YAML `simulator.task` accepts one base task name or `all`. It controls native
+registration and clears the generic task-ID filter, just as RoboDojo does.
+Use Python task lists as above; a list is not a new YAML task syntax. Runtime
+registration remains the authority for the resolved environment IDs.
+
+Actual execution first runs `scripts/preflight/environment.py` with the selected
+simulation interpreter, then the distributed launcher's dry-run and layout
+check. RoboLab has no RoboDojo layout files. Its preflight instead reads genuine
+task subclasses and literal scene paths from `robolab/tasks/benchmark`, checks
+the DROID robot, table fixture, default background, object catalog and direct
+ASCII USD file references, and records installed package versions. Deleted or
+reordered USD list entries are not new asset dependencies. Unknown tasks,
+missing/empty required files, unmaterialized Git LFS pointers and missing package
+metadata fail before startup.
+
+To run only the dependency/asset check against a generated snapshot, use the
+same prepared simulation interpreter and Python path as the deployment:
+
+```bash
+PYTHONPATH="$PWD/scripts:$PWD" /path/to/simulator/python \
+  -m preflight.environment /path/to/run/config_snapshot.py
+```
+
+This check imports no RoboLab/Isaac runtime and opens no USD stage. Remote URLs,
+Kit resolver names and binary/transitive USD/MDL dependencies are explicitly
+outside its coverage; inspect `unchecked_assets` and validate them during later
+simulation acceptance. Installed version metadata does not prove binary/driver
+compatibility. Removing `--dry-run` from the launcher starts real execution and
+therefore requires a prepared model service and separate resource validation.
+
+`simulator.episode_timeout_s` and `simulator.simulator_restart_limit` forward the
+existing worker-supervisor limits. Other benchmarks retain defaults of 3600
+seconds and three restarts. RoboLab's YAML uses zero restarts to avoid silently
+restarting a native random stream. This wall-clock timeout is separate from the
+task's native control-step budget. RoboLab resume is explicitly rejected until
+random-stream and output relocation behavior is validated.
 
 ## Lifecycle and seeds
 
@@ -162,6 +267,7 @@ diagnostic in the later evaluation/report integration.
 
 ```bash
 python -m pytest test/test_environments/test_robolab.py -q
+python -m pytest test/test_robolab_launch.py test/test_robolab_preflight.py -q
 ```
 
 CPU tests cover reuse/switching, clear/double reset order without reseeding,

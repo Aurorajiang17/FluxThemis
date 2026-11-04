@@ -432,7 +432,8 @@ def test_config_contract():
     cfg = Config.fromfile(str(root / 'configs/robolab/droid.py'))
     env = ENVIRONMENTS.build(cfg.themis.evaluation.environment)
     assert isinstance(env, RoboLabEnvironment)
-    assert env.task_names == ('BananaInBowlTask', )
+    assert env.task_names == ('all', )
+    assert cfg.themis.evaluation.episodes_per_task == 1
     assert cfg.themis.transport.state_keys == ['states']
     assert cfg.themis.transport.unnorm_key == 'robolab_droid'
     assert cfg.themis.evaluation.max_episode_steps >= 4500
