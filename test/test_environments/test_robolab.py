@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -96,21 +96,33 @@ def runtime(monkeypatch):
     def close_app():
         state.app_closed += 1
 
-    def launcher(args):
+    def launcher(args, **kwargs):
+        assert kwargs == {'multi_gpu': False}
         state.events.append('launch')
         state.launches.append(args)
         return SimpleNamespace(app=SimpleNamespace(close=close_app))
 
     launcher.add_app_launcher_args = lambda parser: None
+
+    class TaskAConfig:
+
+        def __init__(self):
+            self.instruction = {'default': '  Pick A.\n'}
+
+    class TaskBConfig:
+
+        def __init__(self):
+            self.instruction = {'default': 'Pick B.'}
+
     configs = {
-        'TaskA': SimpleNamespace(instruction={'default': '  Pick A.\n'}),
-        'TaskB': SimpleNamespace(instruction={'default': 'Pick B.'}),
+        'TaskA': TaskAConfig,
+        'TaskB': TaskBConfig,
     }
 
     def create_env(scene, **kwargs):
         env = _NativeEnvironment()
         state.created.append((scene, kwargs, env))
-        return env, configs[scene]
+        return env, configs[scene]()
 
     def register(**kwargs):
         state.registrations.append(kwargs)
@@ -420,6 +432,7 @@ def test_config_contract():
     cfg = Config.fromfile(str(root / 'configs/robolab/droid.py'))
     env = ENVIRONMENTS.build(cfg.themis.evaluation.environment)
     assert isinstance(env, RoboLabEnvironment)
+    assert env.task_names == ('BananaInBowlTask', )
     assert cfg.themis.transport.state_keys == ['states']
     assert cfg.themis.transport.unnorm_key == 'robolab_droid'
     assert cfg.themis.evaluation.max_episode_steps >= 4500
@@ -431,11 +444,17 @@ def test_prelaunch_import_order_and_missing_dependency(monkeypatch):
 
     def load(name):
         imports.append(name)
-        return SimpleNamespace(AppLauncher='launcher')
+
+    # Match the packaged IsaacLab bootstrap: the class is registered as a
+    # from-import entry, without an attribute on the parent module.
+    app = ModuleType('isaaclab.app')
+    monkeypatch.setitem(sys.modules, 'isaaclab.app', app)
+    monkeypatch.setitem(sys.modules, 'isaaclab.app.AppLauncher', 'launcher')
 
     monkeypatch.setattr(module.importlib, 'import_module', load)
     assert module._load_prelaunch_runtime() == 'launcher'
-    assert imports == ['cv2', 'isaaclab.app']
+    assert imports == ['cv2']
+    assert not hasattr(app, 'AppLauncher')
 
     def missing(name):
         raise ModuleNotFoundError(name)
@@ -562,3 +581,40 @@ def test_source_path_is_added_only_at_setup_and_removed(runtime, tmp_path):
     assert str(root) in sys.path
     env.close()
     assert str(root) not in sys.path
+
+
+def test_render_device_is_overridden_before_app_creation():
+    allocated = []
+
+    class Launcher:
+
+        def __init__(self, args, **kwargs):
+            self._sim_app_config = dict(active_gpu=0, physics_gpu=0, **kwargs)
+            self._create_app()
+
+        def _create_app(self):
+            allocated.append(self._sim_app_config.copy())
+
+    module._launch_app(Launcher, SimpleNamespace(), 6)
+    assert allocated == [
+        dict(active_gpu=6, physics_gpu=0, multi_gpu=False, max_gpu_count=1)
+    ]
+    module._launch_app(Launcher, SimpleNamespace(), None)
+    assert allocated[-1] == dict(active_gpu=0, physics_gpu=0, multi_gpu=False)
+
+
+def test_render_device_rejects_unknown_launcher_interface():
+    with pytest.raises(RuntimeError, match='interface'):
+        module._launch_app(lambda args: None, SimpleNamespace(), 6)
+
+
+def test_kit_arguments_reach_launcher(runtime, tmp_path):
+    env = RoboLabEnvironment(
+        task_name='TaskA',
+        output_dir=tmp_path,
+        kit_args='--/plugins/carb.tasking.plugin/threadCount=8')
+    try:
+        env.setup()
+        assert runtime.launches[0].kit_args == env.kit_args
+    finally:
+        env.close()

@@ -10,12 +10,13 @@ own input/output recipes have been validated.
 
 ## Scope and validation status
 
-The initial implementation has CPU contract tests using simulator doubles.
-Real Isaac application startup, same-application task switching, joint ordering,
-rendering and fixed-action trajectory comparisons require a separate simulation
-validation. The full remote launcher, preflight checks, RoboLab report summary
-and historical evaluation protocol are separate integration work. This document
-does not provide a validated full-evaluation launch command.
+The adapter has CPU contract tests and single-worker, fixed-action validation
+against the official RoboLab episode runner. The checked scope includes real
+application startup, same-application task switching, joint ordering, observation
+mapping and native results. The full remote launcher, deployment preflight,
+RoboLab report summary and historical evaluation protocol remain separate
+integration work. This document does not provide a validated full-evaluation
+launch command.
 
 The source reference is RoboLab commit
 `9cce00cadd5dc575fd2b8ea3836f5bdcde574229`. Its development runtime uses
@@ -54,6 +55,21 @@ the DROID joint-position contract is still seven arm joints and one gripper.
 `renderer` and `rendering_mode` are passed to the official factory. Device
 assignment uses the existing worker `configure_simulator_device()` interface.
 
+`device_id` is the CUDA ordinal visible to the worker. `render_device_id` is
+an optional Vulkan/graphics ordinal; when omitted, IsaacLab chooses it from the
+CUDA device as usual. These ordinals can differ when `CUDA_VISIBLE_DEVICES`
+isolates a GPU: in the validated machine, physical GPU 6 became CUDA device 0
+while retaining graphics ordinal 6. The explicit override is applied after
+IsaacLab resolves its devices and before the application allocates resources.
+It relies on the pinned IsaacLab app creation interface and rejects an unknown
+interface. Automatic multi-GPU rendering is disabled for each worker.
+
+`kit_args` forwards deployment-specific Kit arguments, for example rendering
+and thread limits. Neither a particular GPU number nor machine paths are fixed
+in the Python recipe. A launcher must verify the actual device UUID and renderer
+assignment for its machine; the shared worker's CUDA assignment alone does not
+resolve graphics ordinal differences.
+
 ## Lifecycle and seeds
 
 A worker starts one app. The first episode creates a task environment, following
@@ -63,6 +79,12 @@ before creating the next. Each normal episode starts with:
 ```text
 reset_eval_state() -> reset() -> reset() -> use the second observation
 ```
+
+Run the simulator in a dedicated worker process. Isaac Sim's default fast
+shutdown can terminate Python during the final application `close()`. Save
+episode results first and verify worker completion externally; a zero exit code
+alone is insufficient. The existing Themis worker protocol already distinguishes
+an expected shutdown from an exit before the worker receives its stop message.
 
 The native recorder is then assigned a separate `run_N.hdf5` with native env
 index zero, following `robolab/eval/episode.py`. `N` counts episodes within the
@@ -103,8 +125,9 @@ separate validation. Use one worker and consecutive task episodes initially.
 
 Arrays are copied to CPU NumPy memory. The gripper observation has already been
 scaled by RoboLab and is not scaled again. Missing images, incorrect dimensions
-and nonfinite states raise errors. Real joint ordering still needs simulation
-verification against the native action manager. No image resizing, padding,
+and nonfinite states raise errors. In the pinned runtime, both the observation
+and native action manager use `panda_joint1` through `panda_joint7` in that order,
+followed by `finger_joint`. No image resizing, padding,
 tokenization or normalization occurs here.
 
 Each `step()` receives one finite numeric `[8]` action row: seven absolute joint
@@ -135,7 +158,7 @@ native result, or exhaustion of the native outer-loop budget without a result,
 raises an error instead of silently recording an ordinary failure. Review that
 diagnostic in the later evaluation/report integration.
 
-## CPU checks and remaining simulation checks
+## CPU checks and simulation evidence
 
 ```bash
 python -m pytest test/test_environments/test_robolab.py -q
@@ -147,7 +170,37 @@ forwarding, artifact/final-result handling, resource cleanup, config parsing and
 imports with unavailable optional dependencies. Run the existing Themis tests
 as regression coverage too.
 
-The next simulation check should compare official and wrapped execution of
-task A twice followed by task B, with the same seed, renderer, environment count
-and fixed action sequence. Check real reset states, camera layout, joint order,
-termination results and resource release. CPU doubles cannot prove these facts.
+The development simulation check used one native environment, creation seed 0,
+the default instruction and realtime renderer. It replayed saved FP32 action
+rows through the unmodified official `create_env` / `run_episode` functions
+twice, then through this adapter once. No model service was used. Each sequence
+reused the app and ran these episodes consecutively:
+
+| Episode | Official run 1 | Official run 2 | Wrapped run |
+| --- | --- | --- | --- |
+| BananaInBowlTask | Success, 168 steps | Success, 168 steps | Success, 168 steps |
+| BananaInBowlTask, reused env | Tape exhausted at 180 | Tape exhausted at 180 | Tape exhausted at 180 |
+| MustardInRightBinTask | Success, 128 steps | Success, 128 steps | Success, 128 steps |
+| CannedFoodInBinTask | Native timeout, 900 steps | Native timeout, 900 steps | Native timeout, 900 steps |
+
+Across these 12 replay attempts and 4,128 control steps, the recorded reset
+states, per-step physical states, executed actions and native results matched
+exactly between runs. Each sequence created and closed three native instances,
+seeded only at creation, and cleared evaluation state before each double reset.
+The nine completed episodes' HDF5 action rows, sample counts and success flags
+matched the native returns. The three exhausted tapes left the native result
+unset and exported no completed demo; exhaustion is a limitation of the saved
+input sequence, not a benchmark failure.
+
+All 1,380 wrapped observations (four resets plus 1,376 steps) matched their
+same-call native camera and state values. Reward, termination flags, effective
+gripper commands and result metadata were also checked. Independent rendered
+images were not pixel-identical even between the two native repeats; this is
+not a claim of image determinism. No early initialization artifact occurred in
+these simulations, so that branch retains CPU-only coverage. The app processes
+exited and released GPU memory; the small sequence does not establish long-term
+leak freedom or multi-worker equivalence.
+
+This check validates the environment boundary for three tasks and saved actions.
+It does not measure policy success rate, validate the full launcher/reporting
+path, or establish equivalence to the historical ten-environment evaluation.

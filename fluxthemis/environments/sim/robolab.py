@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import logging
 import os
 import re
 import sys
@@ -31,7 +32,10 @@ def _load_prelaunch_runtime():
     try:
         # Required by RoboLab before importing IsaacLab / starting Kit.
         importlib.import_module('cv2')
-        return importlib.import_module('isaaclab.app').AppLauncher
+        # The packaged IsaacLab bootstrap exposes this from-import API without
+        # necessarily setting AppLauncher as an attribute of isaaclab.app.
+        from isaaclab.app import AppLauncher
+        return AppLauncher
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             'RoboLabEnvironment requires the RoboLab Isaac Sim environment; '
@@ -60,6 +64,30 @@ def _load_postlaunch_runtime():
         torch=torch,
         instruction_text=instructions.instruction_text,
         select_instruction_fields=instructions.select_instruction_fields)
+
+
+def _launch_app(launcher, args, render_device_id):
+    """Keep one worker on one GPU, allowing distinct CUDA/Vulkan ordinals."""
+    if render_device_id is None:
+        return launcher(args, multi_gpu=False)
+    if not hasattr(launcher, '_create_app'):
+        raise RuntimeError('Unsupported IsaacLab app creation interface')
+
+    class RenderDeviceLauncher(launcher):
+
+        def _create_app(self):
+            # IsaacLab resolves active_gpu from the CUDA ordinal, overwriting
+            # a constructor argument. Override it after that resolution and
+            # before SimulationApp allocates graphics resources.
+            config = getattr(self, '_sim_app_config', None)
+            if (not isinstance(config, dict)
+                    or not {'active_gpu', 'physics_gpu'} <= config.keys()):
+                raise RuntimeError('Unsupported IsaacLab GPU configuration')
+            config.update(
+                active_gpu=render_device_id, multi_gpu=False, max_gpu_count=1)
+            return super()._create_app()
+
+    return RenderDeviceLauncher(args, multi_gpu=False)
 
 
 def _nonnegative_integer(value, name):
@@ -100,6 +128,8 @@ class RoboLabEnvironment(BaseEnvironment):
                  output_dir: str | os.PathLike = 'work_dirs/robolab',
                  simulator_seed: int = 0,
                  device_id: int = 0,
+                 render_device_id: int | None = None,
+                 kit_args: str = '',
                  headless: bool = True,
                  num_envs: int = 1,
                  camera_keys: Mapping[str, str] | None = None,
@@ -117,6 +147,12 @@ class RoboLabEnvironment(BaseEnvironment):
         self.simulator_seed = _nonnegative_integer(simulator_seed,
                                                    'simulator_seed')
         self.device_id = _nonnegative_integer(device_id, 'device_id')
+        self.render_device_id = (None if render_device_id is None
+                                 else _nonnegative_integer(
+                                     render_device_id, 'render_device_id'))
+        if not isinstance(kit_args, str):
+            raise TypeError('kit_args must be a string')
+        self.kit_args = kit_args
         if _nonnegative_integer(num_envs, 'num_envs') != 1:
             raise ValueError('RoboLabEnvironment supports a single native env')
         if not isinstance(headless, bool):
@@ -193,7 +229,8 @@ class RoboLabEnvironment(BaseEnvironment):
             args.headless = self.headless
             args.enable_cameras = True
             args.device = f'cuda:{self.device_id}'
-            self._app = launcher(args).app
+            args.kit_args = self.kit_args
+            self._app = _launch_app(launcher, args, self.render_device_id).app
             runtime = _load_postlaunch_runtime()
             selection = (None if self.task_names == ('all', ) else list(
                 self.task_names))
@@ -207,8 +244,11 @@ class RoboLabEnvironment(BaseEnvironment):
                 details = factory.get_env_info(name)
                 if details is None:
                     raise ValueError(f'RoboLab has no metadata for {name}')
+                # Official generated configs assign instruction in
+                # __post_init__, so read it from a config instance.
+                task_config = details['config_class']()
                 fields = runtime.select_instruction_fields(
-                    details['config_class'].instruction, 'default')
+                    task_config.instruction, 'default')
                 tasks.append(
                     TaskSpec(
                         task_id=name,
@@ -230,6 +270,7 @@ class RoboLabEnvironment(BaseEnvironment):
             self._task_ids = {task.task_id for task in tasks}
             self._runtime = runtime
         except Exception:
+            logging.getLogger(__name__).exception('RoboLab setup failed')
             self.close()
             raise
 
