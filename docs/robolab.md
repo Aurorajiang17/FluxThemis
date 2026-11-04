@@ -17,8 +17,9 @@ The adapter has CPU contract tests and single-worker, fixed-action validation
 against the official RoboLab episode runner. The checked scope includes real
 application startup, same-application task switching, joint ordering, observation
 mapping and native results. The remote YAML/configuration path and static
-deployment preflight have CPU coverage. Real model/worker integration, RoboLab
-report summaries, continuous model-driven episodes and the historical evaluation
+deployment preflight have CPU coverage. RoboLab event validation and local report
+summaries also have CPU coverage with synthetic events. Real model/worker
+integration, continuous model-driven episodes and the historical evaluation
 protocol remain separate validation work. The commands below prepare/check a
 deployment; they do not establish a validated full-evaluation protocol.
 
@@ -175,6 +176,86 @@ restarting a native random stream. This wall-clock timeout is separate from the
 task's native control-step budget. RoboLab resume is explicitly rejected until
 random-stream and output relocation behavior is validated.
 
+## Evaluation events and local reports
+
+As in [RoboDojo](robodojo.md) and [RoboCasa](robocasa.md), Themis sends
+`run_start`, `episode_start`, `episode_end` and `run_end` events to the FluxVLA
+service. The existing reporter mirrors events locally after the server accepts
+them. FluxVLA validates session/sequence and episode identity, journals accepted
+events and writes summaries at `run_end`. No extra report service is required.
+[RoboTwin](robotwin.md) uses similar summary filenames in its evaluation tools;
+its separate runner/manager reporting path is not a RoboLab dependency.
+
+In FluxVLA, `configs/pi05/pi05_paligemma_robolab_droid_jointpos_inference.py`
+enables `themis.server.evaluation_reporting` with `report_kind='robolab'` and
+explicitly selects its existing `eval` dataset section. Report metadata lives in
+that section; it does not change the model, transforms or precision. The actual
+task manifest and per-task quotas come from Themis's `run_start`, including
+subsets and overrides, rather than a second task list in the model config.
+
+`themis.server.evaluation_reporting.result_output_dir` optionally selects the
+model-side report root. An absolute path is used directly; a relative path is
+resolved against the checkpoint's grandparent directory. Omitting it uses that
+grandparent. Each run has a unique directory under
+`eval_runs/<checkpoint_stem>/EVAL-robolab-<model_family>-<timestamp>[-<run_name>]`.
+Set paths in the model service's deployment config or `--cfg-options`, not in
+the environment recipe. Disabling `evaluation_reporting.enabled` is suitable
+for inference-only diagnostics, not a Themis evaluation expecting report ACKs.
+
+| Owner | Artifacts |
+| --- | --- |
+| RoboLab on the simulator host | Native HDF5 under the Themis run's `native/worker/instance` directories |
+| Themis | Run plan, configuration snapshot, local event mirror and evaluation outputs |
+| FluxVLA | Accepted `events.jsonl`, `rank_progress/rank0.json`, `robolab/task<index>_results.json`, `summary.json/csv/txt`, `task_success_rates.csv`, `task_status/` and `failed_tasks.txt` |
+
+Per-task JSON preserves the runtime task ID, description and metadata, plus
+each episode's identity, prediction metadata and full environment `info`.
+`native_output_dir`, `environment_instance` and `instance_episode` identify the
+native evidence; `simulator_seed` remains distinct from scheduling seeds. These
+are simulator-host paths, not proof that a file exists or is readable from the
+model host. Reports set `native_artifacts_verified=false`; later real execution
+must check the native files against accepted events. There are no additional
+global `gpuN_task...` mirrors.
+
+RoboLab reporting uses the native success boolean, following the reference
+`robolab/eval/summarize.py` and `robolab/core/logging/results.py`. It does not
+substitute RoboDojo score/categories or RoboTwin Easy/Hard groupings.
+
+| Field | Meaning |
+| --- | --- |
+| `planned_episodes` | Quota in this run's selected task manifest |
+| `completed_episodes` | Accepted `episode_end` events |
+| `native_episodes` | Accepted episodes with a frozen, complete native result |
+| `unscored_episodes` | Accepted episodes without a native terminal result |
+| `missing_episodes` | Planned episodes without an accepted end event |
+| `success_rate_pct` | Native successes / native episodes, multiplied by 100; null/blank when there are none |
+| `plan_complete` / `results_complete` | All planned ends accepted / all planned native results present |
+| `report_complete` | Run status is `finished` and native results cover every planned episode |
+
+For example, 1/1 successes on one task and 1/3 on another give 2/4 = 50% overall,
+not an unweighted average of task rates. A wrapper `max_steps` cutoff before
+native freeze is unscored, not an ordinary native failure. A success claim
+without native evidence, conflicting success flags or conflicting episode
+identity is rejected. Partial reports retain the observed rate and its native
+denominator alongside unscored/missing counts; that rate is not a full result.
+`duration_s` in task/overall statistics sums recorded episode wall times; the
+top-level duration is the run wall time, not simulated control time.
+
+The run's `finished`, `failed` or `interrupted` status and error are preserved.
+An inconsistent `finished` label cannot make missing quota complete. Task status
+`COMPLETE` means native results cover the quota, even if every episode failed;
+its record is `status|successes|native_episodes|planned_episodes`.
+`failed_tasks.txt` contains task indexes with missing/unscored results, not a
+list of policy failures. `full_suite=null` means full benchmark coverage is
+unverified: completing a selected plan does not prove a full benchmark run.
+
+This integration does not calculate the optional native subtask score,
+trajectory metrics or confidence intervals. It records local reports only and
+explicitly skips Feishu. If the process is killed before `run_end`, accepted
+events may exist without a final summary; automatic recovery/resume is not
+implemented. Synthetic-event CPU tests cover reporting only, not transport,
+native artifact export or model-driven evaluation.
+
 ## Lifecycle and seeds
 
 A worker starts one app. The first episode creates a task environment, following
@@ -275,6 +356,15 @@ separate seed metadata, observation ownership/precision, absolute action
 forwarding, artifact/final-result handling, resource cleanup, config parsing and
 imports with unavailable optional dependencies. Run the existing Themis tests
 as regression coverage too.
+
+On the FluxVLA side, run
+`test/test_runners/test_robolab_evaluation_report_writer.py` together with the
+existing report/serving tests. These use synthetic events and an empty temporary
+checkpoint to check report construction without loading weights. On a CPU-only
+development installation, use the repository's existing `--cpu-model-tests`
+import isolation with GPUs hidden; it does not validate production model
+imports. No simulator package, real checkpoint or external report endpoint is
+needed by these tests.
 
 The development simulation check used one native environment, creation seed 0,
 the default instruction and realtime renderer. It replayed saved FP32 action
