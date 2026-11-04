@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from fluxthemis.model_clients.fluxvla_policy import FluxVLAPolicyClient
 from fluxthemis.reporters.fluxvla_reporter import FluxVLAEvaluationReporter
@@ -103,3 +104,62 @@ def test_reporter_only_handles_evaluation_lifecycle():
     assert run_dir == '/tmp/evaluation'
     assert reporter.evaluation_report_run_dir == '/tmp/evaluation'
     assert not hasattr(reporter, 'predict_action')
+
+
+@pytest.mark.parametrize('value', [
+    np.ones((2, 8), dtype=bool),
+    np.full((2, 8), '0.25'),
+    np.full((2, 8), 0.25 + 1j),
+    [[True] + [0.25] * 7] * 2,
+    [np.zeros(8), np.ones(8, dtype=bool)],
+])
+def test_policy_rejects_non_real_response_actions(value):
+    client = FluxVLAPolicyClient({
+        'image_keys': ['image'],
+        'state_keys': ['state']
+    })
+    header = dict(type='predict_response', ok=True, request_id='request')
+    with pytest.raises(TypeError, match='real numbers'):
+        client._validate_response(header, encode_frame({'actions': value}),
+                                  'request')
+
+
+@pytest.mark.parametrize('value', [np.nan, np.inf, 1e100])
+def test_policy_rejects_nonfinite_or_overflowed_actions(value):
+    client = FluxVLAPolicyClient({
+        'image_keys': ['image'],
+        'state_keys': ['state']
+    })
+    header = dict(type='predict_response', ok=True, request_id='request')
+    with pytest.raises(RuntimeError, match='NaN|infinite|FP32'):
+        client._validate_response(
+            header, encode_frame({'actions': np.full((2, 8), value)}),
+            'request')
+
+
+@pytest.mark.parametrize('width', [8, 14, 29])
+def test_policy_preserves_numeric_actions_and_resets_request_identity(width):
+    client = FluxVLAPolicyClient({
+        'image_keys': ['image'],
+        'state_keys': ['state']
+    })
+    transport = _FakeTransport('predict_response')
+    client.transport = transport
+    observation = dict(
+        image=np.zeros((4, 4, 3), np.uint8), state=np.zeros(width))
+    context = {'task_description': 'pick'}
+    for episode in range(2):
+        client.reset(TaskSpec('pick'), episode, policy_seed=10 + episode)
+        client.set_episode_id(f'run:{episode + 1}')
+        for sequence in (1, 2):
+            chunk = client.predict_action(observation, context)
+            assert chunk.metadata['sequence'] == sequence
+            assert chunk.metadata['episode_id'] == f'run:{episode + 1}'
+            assert chunk.metadata['policy_seed'] == 10 + episode
+    assert len({h['request_id'] for h, _ in transport.requests}) == 4
+    values = np.arange(width * 3, dtype=np.float64).reshape(3, width) / 8
+    actual, _ = client._validate_response(
+        dict(type='predict_response', ok=True, request_id='request'),
+        encode_frame({'actions': values}), 'request')
+    assert actual.dtype == np.float32
+    np.testing.assert_array_equal(actual, values.astype(np.float32))

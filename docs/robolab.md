@@ -18,7 +18,11 @@ against the official RoboLab episode runner. The checked scope includes real
 application startup, same-application task switching, joint ordering, observation
 mapping and native results. The remote YAML/configuration path and static
 deployment preflight have CPU coverage. RoboLab event validation and local report
-summaries also have CPU coverage with synthetic events. Real model/worker
+summaries also have CPU coverage with synthetic events. A development CPU check
+connects the real FluxVLA broker/model-worker loop and Themis launcher, supervisor,
+worker, adapter and reporter, using a deterministic policy and a synthetic native
+runtime. It checks action order, consecutive episodes, task switching and fault
+handling; it does not load model weights or simulate physics. Real model/Isaac
 integration, continuous model-driven episodes and the historical evaluation
 protocol remain separate validation work. The commands below prepare/check a
 deployment; they do not establish a validated full-evaluation protocol.
@@ -324,6 +328,29 @@ strictly greater than 0.5. Boolean actions are rejected because RoboLab's boolea
 branch has different semantics. The shared episode runner handles action chunks;
 `execute_horizon=None` leaves the chunk length to the policy response.
 
+The shared serving/client/execution boundary accepts integer and floating-point
+actions and returns finite FP32 values. Boolean, string, complex and object
+actions are rejected before conversion, including mixed boolean/numeric lists.
+Values that overflow FP32 are rejected as well. This check applies to every
+policy using these boundaries; it does not change model-internal masks, tokens,
+denormalization, action dimensions or gripper thresholds. The RoboLab adapter
+continues to enforce its own eight-value action row.
+
+A completed or truncated episode discards the remainder of its action chunk.
+The next episode resets the policy context and request sequence. A ZMQ timeout
+replaces the request socket without replaying the prediction; a late reply cannot
+be consumed as the next request. A worker exit with code zero is only an orderly
+stop after the coordinator's shutdown message. Unexpected exits consume the
+configured restart budget; the remote development template keeps that budget at
+zero. A CPU test of a permitted restart checks job identity, not equivalence of
+native simulator random state after recovery.
+
+Transport/model failures abort evaluation instead of becoming ordinary native
+task failures. When the report service remains available, the failed run records
+missing episodes. A fatal broker timeout can prevent a final report from being
+written: retain the partial event journal and process logs, and treat the run as
+incomplete. Do not infer success from the existence of an output directory.
+
 ## End conditions and limits
 
 An early raw termination can be an initialization artifact that RoboLab resets
@@ -349,6 +376,7 @@ diagnostic in the later evaluation/report integration.
 ```bash
 python -m pytest test/test_environments/test_robolab.py -q
 python -m pytest test/test_robolab_launch.py test/test_robolab_preflight.py -q
+python -m pytest test/test_model_clients.py test/test_transports.py test/test_engines/ -q
 ```
 
 CPU tests cover reuse/switching, clear/double reset order without reseeding,
@@ -356,6 +384,13 @@ separate seed metadata, observation ownership/precision, absolute action
 forwarding, artifact/final-result handling, resource cleanup, config parsing and
 imports with unavailable optional dependencies. Run the existing Themis tests
 as regression coverage too.
+
+The transport checks use local ZMQ sockets. Worker/coordinator tests cover stale
+identities, restart budgets, shutdown acknowledgements and report acknowledgement
+before counting a result. These portable tests need no simulator or checkpoint.
+Machine-specific cross-repository process fixtures and their synthetic task
+quotas stay outside the repositories; they are development evidence, not a
+replacement for the official Python task selection or deployment preflight.
 
 On the FluxVLA side, run
 `test/test_runners/test_robolab_evaluation_report_writer.py` together with the
