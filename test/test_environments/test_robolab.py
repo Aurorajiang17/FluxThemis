@@ -17,6 +17,117 @@ from fluxthemis.environments.sim.robolab import RoboLabEnvironment
 from fluxthemis.structures import TaskSpec
 
 
+@pytest.mark.parametrize('token,visible,expected_cuda',
+                         [('2', '2', 0), ('GPU-bb', 'GPU-bb', 0),
+                          ('2', '5,2', 1), ('GPU-bb', 'GPU-cc,GPU-bb', 1)])
+def test_explicit_render_map_preserves_cuda_numbering(monkeypatch, token,
+                                                      visible, expected_cuda):
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', visible)
+    env = RoboLabEnvironment('TaskA', render_device_map={token: 4})
+    env.configure_simulator_device(token)
+    assert env.device_id == expected_cuda
+    assert env.render_device_id == 4
+
+
+@pytest.mark.parametrize('mapping', [{}, {
+    '2': -1
+}, {
+    '2': True
+}, {
+    2: 1
+}, {
+    'bad': 1
+}, [('2', 1)]])
+def test_render_map_rejects_invalid_configuration(mapping):
+    with pytest.raises((TypeError, ValueError)):
+        RoboLabEnvironment('TaskA', render_device_map=mapping)
+
+
+def test_render_map_requires_assignment_and_rejects_conflicts(monkeypatch):
+    with pytest.raises(ValueError, match='render_device'):
+        RoboLabEnvironment(
+            'TaskA', render_device_id=1, render_device_map={'2': 4})
+    env = RoboLabEnvironment('TaskA', render_device_map={'2': 4})
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3')
+    with pytest.raises(ValueError, match='render_device_map'):
+        env.configure_simulator_device('3')
+    monkeypatch.setattr(module, '_load_prelaunch_runtime',
+                        lambda: pytest.fail('Kit must not be imported'))
+    with pytest.raises(ValueError, match='assignment'):
+        env.setup()
+
+
+@pytest.mark.parametrize('kit_args', [
+    '--portable-root /manual', '--portable-root=/manual',
+    '--/app/tokens/omni_global_logs=/manual'
+])
+def test_managed_kit_cache_rejects_manual_paths(tmp_path, kit_args):
+    with pytest.raises(ValueError, match='kit_cache_root'):
+        RoboLabEnvironment('TaskA', kit_cache_root=tmp_path, kit_args=kit_args)
+
+
+def test_managed_kit_cache_rejects_whitespace(tmp_path):
+    with pytest.raises(ValueError, match='whitespace'):
+        RoboLabEnvironment('TaskA', kit_cache_root=tmp_path / 'has space')
+
+
+def test_managed_kit_cache_is_ready_before_import_and_worker_isolated(
+        runtime, tmp_path, monkeypatch):
+    root = tmp_path / 'cache'
+    keys = ('XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+            'OPTIX_CACHE_PATH', '__GL_SHADER_DISK_CACHE_PATH')
+    for key in keys:
+        monkeypatch.setenv(key, str(tmp_path / 'original' / key))
+    original = {key: os.environ[key] for key in keys}
+    loader = module._load_prelaunch_runtime
+    observed = []
+
+    def checked_loader():
+        paths = {key: Path(os.environ[key]) for key in keys}
+        assert all(path.is_dir() and root in path.parents
+                   for path in paths.values())
+        observed.append(paths)
+        return loader()
+
+    monkeypatch.setattr(module, '_load_prelaunch_runtime', checked_loader)
+    for worker in ('worker-a', 'worker-b'):
+        env = RoboLabEnvironment(
+            'TaskA',
+            output_dir=tmp_path / 'native',
+            kit_cache_root=root,
+            kit_args='--allow-root')
+        env.configure_worker(worker, 'same-run')
+        monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2')
+        env.configure_simulator_device('2')
+        env.setup()
+        args = runtime.launches[-1].kit_args.split()
+        portable = Path(args[args.index('--portable-root') + 1])
+        assert portable.is_dir() and '--allow-root' in args
+        assert root in portable.parents
+        assert root not in env._worker_dir.parents
+        env.close()
+        assert {key: os.environ[key] for key in keys} == original
+        assert portable.exists()  # Cleanup is an explicit deployment action.
+    assert observed[0]['XDG_CACHE_HOME'] != observed[1]['XDG_CACHE_HOME']
+
+
+def test_managed_kit_cache_restores_environment_after_launch_failure(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv('OPTIX_CACHE_PATH', raising=False)
+    monkeypatch.setenv('XDG_CACHE_HOME', 'original-cache')
+
+    def fail_loader():
+        assert Path(os.environ['OPTIX_CACHE_PATH']).is_dir()
+        raise RuntimeError('test launch failed')
+
+    monkeypatch.setattr(module, '_load_prelaunch_runtime', fail_loader)
+    env = RoboLabEnvironment('TaskA', kit_cache_root=tmp_path)
+    with pytest.raises(RuntimeError, match='test launch failed'):
+        env.setup()
+    assert 'OPTIX_CACHE_PATH' not in os.environ
+    assert os.environ['XDG_CACHE_HOME'] == 'original-cache'
+
+
 def _observation(marker=0, dtype=np.float64):
     return {
         'image_obs': {
@@ -107,11 +218,15 @@ def runtime(monkeypatch):
     class TaskAConfig:
 
         def __init__(self):
+            self.sim = SimpleNamespace(dt=1 / 120)
+            self.decimation = 8
             self.instruction = {'default': '  Pick A.\n'}
 
     class TaskBConfig:
 
         def __init__(self):
+            self.sim = SimpleNamespace(dt=1 / 120)
+            self.decimation = 8
             self.instruction = {'default': 'Pick B.'}
 
     configs = {
@@ -152,6 +267,19 @@ def runtime(monkeypatch):
 
     monkeypatch.setattr(module, '_load_prelaunch_runtime', lambda: launcher)
     monkeypatch.setattr(module, '_load_postlaunch_runtime', postlaunch)
+    state.metrics_calls = []
+
+    def metrics(path, dt, success, steps):
+        state.metrics_calls.append((path, dt, success, steps))
+        return (1.0 if success else 0.5), dict(
+            metrics={
+                'ee_speed_mean': 0.03,
+                'ee_sparc': -8.0
+            },
+            metrics_complete=True,
+            metrics_compute_s=0.01)
+
+    monkeypatch.setattr(module, 'collect_episode_metrics', metrics)
     return state
 
 
@@ -162,6 +290,115 @@ def environment(runtime, tmp_path):
     env.configure_worker('worker-0', 'run-1')
     env.setup()
     yield env
+    env.close()
+
+
+class _BatchNative(_NativeEnvironment):
+
+    def __init__(self, size):
+        super().__init__()
+        self.num_envs = size
+        self.episode_length_buf = np.zeros(size, dtype=np.int64)
+        self.active_env_ids = list(range(size))
+        self.results = [
+            dict(env_id=i, success=None, step=None) for i in range(size)
+        ]
+        self.finish_steps = [3, 5, 6]
+
+    def reset_eval_state(self):
+        super().reset_eval_state()
+        self.active_env_ids = list(range(self.num_envs))
+        self.results = [
+            dict(env_id=i, success=None, step=None)
+            for i in range(self.num_envs)
+        ]
+
+    def reset(self, **kwargs):
+        raw, info = super().reset(**kwargs)
+        self.raw = {
+            group: {
+                key: np.repeat(value, self.num_envs, axis=0)
+                for key, value in fields.items()
+            }
+            for group, fields in raw.items()
+        }
+        return self.raw, info
+
+    def step(self, actions):
+        self.actions.append(actions.copy())
+        self.episode_length_buf += 1
+        for lane in tuple(self.active_env_ids):
+            if self.episode_length_buf[lane] == self.finish_steps[lane]:
+                self.results[lane] = dict(
+                    env_id=lane,
+                    success=lane != 1,
+                    step=int(self.episode_length_buf[lane]))
+                self.active_env_ids.remove(lane)
+        self.all_terminated = not self.active_env_ids
+        zeros = np.zeros(self.num_envs)
+        return self.raw, zeros, zeros, zeros, {}
+
+    def get_env_results(self):
+        return [dict(result) for result in self.results]
+
+
+def test_native_batch_freezes_lanes_and_preserves_reset_lifecycle(
+        runtime, tmp_path, monkeypatch):
+    from fluxthemis.environments.sim import robolab_batch
+    create = runtime.runtime.create_env
+
+    def batch_create(*args, **kwargs):
+        _, cfg = create(*args, **kwargs)
+        env = _BatchNative(kwargs['num_envs'])
+        runtime.created[-1] = (args[0], kwargs, env)
+        return env, cfg
+
+    runtime.runtime.create_env = batch_create
+    calls = []
+    monkeypatch.setattr(
+        robolab_batch, 'collect_episode_metrics',
+        lambda path, dt, success, steps, demo_key: (calls.append(
+            (demo_key, success, steps)) or 0.5, {}))
+    env = RoboLabEnvironment(
+        task_name=['TaskA', 'TaskB'], num_envs=3, output_dir=tmp_path)
+    env.setup()
+
+    def reset(task=0):
+        return env.reset_batch(
+            env.tasks()[task], [0, 1, 2],
+            environment_seeds=[7, 8, 9],
+            environment_case_indices=[0, 1, 2])
+
+    observations = reset()
+    native = runtime.created[-1][2]
+    assert native.events[:3] == ['clear', ('reset', {}), ('reset', {})]
+    assert native.events[3:] == [('file', 'run_0.hdf5')] + [('index', i, {
+        'env_ids': [i]
+    }) for i in range(3)]
+    assert len({info['native_hdf5_path'] for _, info in observations}) == 1
+    assert [info['native_demo_key']
+            for _, info in observations] == ['demo_0', 'demo_1', 'demo_2']
+    for step in range(1, 7):
+        active = set(native.active_env_ids)
+        transitions = env.step_batch({i: np.ones(8) * i for i in active})
+        assert set(transitions) == active
+        if step > 3:
+            np.testing.assert_array_equal(native.actions[-1][0], np.zeros(8))
+    assert calls == [('demo_0', True, 3), ('demo_1', False, 5),
+                     ('demo_2', True, 6)]
+    with pytest.raises(RuntimeError, match='reset_batch'):
+        env.step_batch({})
+    second = reset()
+    assert len(runtime.created) == 1 and native.resets == 4
+    assert second[0][1]['instance_episode'] == 1
+    reset(1)
+    assert native.closed == 1 and len(runtime.created) == 2
+    native = runtime.created[-1][2]
+    native.finish_steps = [99, 99, 99]
+    for _ in range(5):
+        env.step_batch({i: np.zeros(8) for i in range(3)})
+    with pytest.raises(RuntimeError, match='outer-loop limit'):
+        env.step_batch({i: np.zeros(8) for i in range(3)})
     env.close()
 
 
@@ -351,7 +588,7 @@ def test_activation_failure_closes_native_and_app(runtime, tmp_path):
     runtime.runtime.create_env = invalid
     env = RoboLabEnvironment(task_name='TaskA', output_dir=tmp_path)
     env.setup()
-    with pytest.raises(ValueError, match='single'):
+    with pytest.raises(ValueError, match='batch_size'):
         _reset(env)
     assert runtime.created[0][2].closed == 1
     assert runtime.app_closed == 1
@@ -619,3 +856,85 @@ def test_kit_arguments_reach_launcher(runtime, tmp_path):
         assert runtime.launches[0].kit_args == env.kit_args
     finally:
         env.close()
+
+
+@pytest.mark.parametrize('value', [False, True, 0, -1, 2.5, '6'])
+def test_cpu_thread_limit_validation(value):
+    with pytest.raises((TypeError, ValueError), match='cpu_thread_limit'):
+        RoboLabEnvironment(task_name='TaskA', cpu_thread_limit=value)
+
+
+@pytest.mark.parametrize('render_device', [None, 6])
+def test_cpu_limit_reaches_simulation_app_before_allocation(render_device):
+    allocated = []
+
+    class Launcher:
+
+        def __init__(self, args, **kwargs):
+            self._sim_app_config = dict(active_gpu=0, physics_gpu=0, **kwargs)
+            self._create_app()
+
+        def _create_app(self):
+            allocated.append(self._sim_app_config.copy())
+
+    module._launch_app(Launcher, SimpleNamespace(), render_device, 6)
+    assert allocated[0]['limit_cpu_threads'] == 6
+    assert allocated[0]['active_gpu'] == (render_device or 0)
+    assert allocated[0]['physics_gpu'] == 0
+    assert allocated[0]['multi_gpu'] is False
+
+
+def test_cpu_limit_is_optional_and_preserves_default():
+    assert RoboLabEnvironment(task_name='TaskA').cpu_thread_limit is None
+    assert RoboLabEnvironment(
+        task_name='TaskA', cpu_thread_limit=6).cpu_thread_limit == 6
+
+
+def test_cpu_limit_rejects_unknown_launcher_interface():
+    with pytest.raises(RuntimeError, match='interface'):
+        module._launch_app(lambda args: None, SimpleNamespace(), None, 6)
+
+
+def test_terminal_score_and_metrics_are_collected_once(environment, runtime):
+    _reset(environment)
+    native = runtime.created[0][2]
+    assert environment.step(np.zeros(8)).score is None
+    assert runtime.metrics_calls == []
+    native.next_success = False
+    result = environment.step(np.zeros(8))
+    assert result.score == 0.5 and result.success is False
+    assert result.info['metrics']['ee_speed_mean'] == 0.03
+    assert len(runtime.metrics_calls) == 1
+    path, dt, success, steps = runtime.metrics_calls[0]
+    assert path.endswith('run_0.hdf5') and dt == 1 / 15
+    assert not success and steps == 3
+
+
+@pytest.mark.parametrize('artifact_step', [1, 2])
+@pytest.mark.parametrize('eventual_success', [False, True])
+def test_internal_early_reset_never_extends_outer_budget(
+        environment, runtime, monkeypatch, artifact_step, eventual_success):
+    _reset(environment)
+    native = runtime.created[0][2]
+    original = native.step
+
+    def step(action):
+        result = original(action)
+        if len(native.actions) == artifact_step:
+            native.episode_length_buf[:] = 0
+            return (*result[:2], np.array([True]), np.array([False]), {})
+        return result
+
+    monkeypatch.setattr(native, 'step', step)
+    for _ in range(5):
+        environment.step(np.zeros(8))
+    if eventual_success:
+        native.next_success = True
+        result = environment.step(np.zeros(8))
+        assert result.success and result.info['wrapper_steps'] == 6
+    else:
+        with pytest.raises(
+                RuntimeError, match='native_episode_step=.*raw_terminated'):
+            environment.step(np.zeros(8))
+        assert environment._steps == 6
+        assert native.episode_length_buf[0] == 6 - artifact_step

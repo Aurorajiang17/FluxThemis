@@ -205,6 +205,82 @@ def test_restart_limit_zero_rejects_first_restart(startup):
         coordinator._receive_worker_message(evaluation_run)
 
 
+def test_batch_releases_worker_only_after_last_acknowledged_result(
+        monkeypatch):
+    jobs = build_episode_jobs([TaskSpec('task')], 3, 7, 'run')
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(jobs[0])
+    state = _SchedulingState.from_jobs(jobs)
+    state.pending_jobs.clear()
+    coordinator._scheduling_state = state
+    slot.current_group = jobs
+    slot.batch_size = 3
+    acknowledged = []
+    monkeypatch.setattr(evaluation_run, 'on_episode_end',
+                        lambda result, eid: acknowledged.append(eid))
+    environment = MockEnvironment(tasks=['task'], success_after=1)
+    environment.setup()
+    for job in (jobs[2], jobs[0], jobs[1]):
+        result = execute_episode(environment, MockPolicyClient(action_dim=8),
+                                 job, 2, None, True)
+        coordinator._worker_router.incoming = [
+            slot.routing_id,
+            encode_header(
+                'episode_end',
+                deployment_id='deployment',
+                worker_id=slot.worker_id,
+                generation=0,
+                episode_id=job.episode_id),
+            encode_frame(to_jsonable(result))
+        ]
+        coordinator._receive_worker_message(evaluation_run)
+        assert slot.is_idle == (len(acknowledged) == 3)
+        if len(acknowledged) < 3:
+            with pytest.raises(RuntimeError, match='duplicate'):
+                coordinator._receive_worker_message(evaluation_run)
+    assert not slot.current_group
+    assert list(coordinator._idle_worker_ids) == [slot.worker_id]
+    environment.close()
+
+
+def test_native_batch_configuration_rejects_incomplete_and_restarted_runs():
+    jobs = build_episode_jobs([TaskSpec('task')], 3, 7, 'run')
+    coordinator, slot, _ = _coordinator_with_active_job(jobs[0])
+    slot.batch_size = 3
+    settings = EvaluationSettings(episode_batch_size=3)
+    with pytest.raises(ValueError, match='restart_limit=0'):
+        coordinator._configure_batches(settings, jobs)
+    coordinator.simulator_restart_limit = 0
+    coordinator._configure_batches(settings, jobs)
+    wrong_quota = build_episode_jobs([TaskSpec('task')], 4, 7, 'run')
+    with pytest.raises(ValueError, match='divisible'):
+        coordinator._configure_batches(settings, wrong_quota)
+    assert EvaluationSettings(
+        episode_batch_size=3, resume_path='old').resume_path
+    with pytest.raises(ValueError, match='dynamic'):
+        EvaluationSettings(episode_batch_size=3, strict_worker_assignment=True)
+    with pytest.raises(RuntimeError, match='restart'):
+        coordinator._replace_worker_connection(
+            slot, routing_id=b'new', generation=1)
+
+
+def test_batch_dispatch_preserves_seeds_and_same_task_groups():
+    from collections import deque
+    jobs = build_episode_jobs([TaskSpec('a'), TaskSpec('b')], 3, 7, 'run')
+    coordinator, slot, _ = _coordinator_with_active_job(jobs[0])
+    coordinator._episode_batch_size = 3
+    state = _SchedulingState.from_jobs(jobs)
+    # Scheduling priority can differ from canonical seed assignment.
+    state.pending_jobs = deque(jobs[3:] + jobs[:3])
+    coordinator._scheduling_state = state
+    slot.current_job = None
+    coordinator._idle_worker_ids.append(slot.worker_id)
+    coordinator._dispatch_jobs()
+    assert slot.current_group == jobs[3:]
+    assert [j.policy_seed for j in slot.current_group] == [10, 11, 12]
+    assert tuple(state.pending_jobs) == jobs[:3]
+    assert len(coordinator._worker_router.sent) == 1
+
+
 def test_report_failure_does_not_complete_or_release_job(monkeypatch):
     job = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')[0]
     coordinator, slot, evaluation_run = _coordinator_with_active_job(job)

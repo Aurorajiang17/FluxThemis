@@ -80,6 +80,32 @@ def test_python_task_list_preserves_order(launch):
     assert evaluation.episodes_per_task == 3
 
 
+def test_native_batch_launch_validates_before_simulation(launch, tmp_path):
+    path = write_launch(tmp_path, simulator_restart_limit=0)
+    options = {
+        'themis.evaluation.episode_batch_size': 10,
+        'themis.evaluation.episodes_per_task': 10,
+        'themis.evaluation.environment.num_envs': 10
+    }
+    settings = launch.load_config(path, overrides=dict(cfg_options=options))
+    assert settings['config'].themis.evaluation.episode_batch_size == 10
+    smoke = launch.load_config(
+        path,
+        mode='smoke',
+        overrides=dict(cfg_options=options, workers_per_gpu=2))
+    assert smoke['config'].themis.evaluation.episodes_per_task == 20
+    for key, value in [('themis.evaluation.episodes_per_task', 9),
+                       ('themis.evaluation.environment.num_envs', 1)]:
+        with pytest.raises(ValueError):
+            launch.load_config(
+                path, overrides=dict(cfg_options={
+                    **options, key: value
+                }))
+    with pytest.raises(ValueError, match='restart_limit=0'):
+        launch.load_config(
+            write_launch(tmp_path), overrides=dict(cfg_options=options))
+
+
 def test_root_precedence_and_child_environment(launch, tmp_path, monkeypatch):
     monkeypatch.setenv('ROBOLAB_ROOT', str(tmp_path / 'fallback'))
     monkeypatch.setenv('ROBO_TEST_ROOT', str(tmp_path / 'installed'))
