@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from fluxthemis.engines.runners.resume import (atomic_json, digest,
+                                               read_bundle, validate_bundle)
 from fluxthemis.engines.utils import EVALUATION_REPORTERS
 from fluxthemis.transports.fluxvla_zmq import FluxVLAZMQTransport
 from fluxthemis.transports.zmq_protocol import (decode_frame, encode_frame,
@@ -58,6 +60,17 @@ class FluxVLAEvaluationReporter(BaseEvaluationReporter):
     @property
     def evaluation_report_run_dir(self) -> str | None:
         return self._run_dir
+
+    def persist_resume_input(self, bundle: Mapping[str, Any]) -> None:
+        if self._event_log is None:
+            return
+        validate_bundle(bundle)
+        path = self._event_log.parent / 'resume_input.json'
+        if path.exists():
+            if digest(read_bundle(path)) != digest(bundle):
+                raise ValueError('Conflicting journal-local resume_input.json')
+            return
+        atomic_json(path, bundle)
 
     def report_evaluation(self, event_type: str, payload: Mapping[str,
                                                                   Any]) -> str:

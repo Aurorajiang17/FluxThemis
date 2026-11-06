@@ -20,6 +20,12 @@ class BaseEvaluationReporter(ABC):
         """Authoritative artifact directory acknowledged by the service."""
         return None
 
+    def persist_resume_input(self, bundle: Mapping[str, Any]) -> None:
+        """Persist recovery input before run_start, if a local journal exists.
+
+        Reporters without a local journal retain their existing behavior.
+        """
+
     @abstractmethod
     def report_evaluation(self, event_type: str, payload: Mapping[str,
                                                                   Any]) -> str:

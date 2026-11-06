@@ -32,6 +32,8 @@ class _WorkerSlot:
     device: str
     task_manifest: tuple[TaskSpec, ...] = ()
     current_job: EpisodeJob | None = None
+    current_group: tuple[EpisodeJob, ...] = ()
+    batch_size: int = 1
     episode_deadline: float | None = None
     recovery_deadline: float | None = None
     simulator_ready: bool = False
@@ -120,6 +122,7 @@ class DistributedEvaluationCoordinator:
         self._context = None
         self._stopping = False
         self._strict_worker_assignment = False
+        self._episode_batch_size = 1
 
     def run(self, evaluation_run: EvaluationRun) -> dict[str, Any]:
         import zmq
@@ -195,7 +198,15 @@ class DistributedEvaluationCoordinator:
             run_session_id=evaluation_run.run_session_id,
             episodes_per_task_overrides=settings.episodes_per_task_overrides,
         )
+        self._configure_batches(settings, jobs)
         scheduling_state = _SchedulingState.from_jobs(jobs)
+        if settings.task_schedule is not None:
+            order = {task: i for i, task in enumerate(settings.task_schedule)}
+            scheduling_state.pending_jobs = deque(
+                sorted(
+                    jobs,
+                    key=lambda job:
+                    (order[job.task.task_id], job.episode_index)))
         self._scheduling_state = scheduling_state
 
         try:
@@ -251,6 +262,25 @@ class DistributedEvaluationCoordinator:
             )
             raise
 
+    def _configure_batches(self, settings, jobs):
+        size = settings.episode_batch_size
+        if any(slot.batch_size != size
+               for slot in self._worker_slots.values()):
+            raise ValueError('Worker batch_size differs from evaluation')
+        if settings.task_schedule is not None and set(
+                settings.task_schedule) != {job.task.task_id
+                                            for job in jobs}:
+            raise ValueError(
+                'task_schedule must list every selected task once')
+        if size > 1:
+            if self.simulator_restart_limit != 0:
+                raise ValueError(
+                    'Native batches require simulator_restart_limit=0')
+            if any(job.episodes_per_task % size for job in jobs):
+                raise ValueError(
+                    'Task episode counts must be divisible by batch_size')
+        self._episode_batch_size = size
+
     def _restore_jobs(self, evaluation_run: EvaluationRun) -> None:
         data = evaluation_run.resume_data
         if not data:
@@ -264,7 +294,8 @@ class DistributedEvaluationCoordinator:
                 job,
                 environment_case_index=saved[job.global_episode_number]
                 ['environment_case_index'])
-        state.pending_jobs = deque(state.jobs_by_episode_id.values())
+        state.pending_jobs = deque(state.jobs_by_episode_id[job.episode_id]
+                                   for job in state.pending_jobs)
         state.next_environment_case_index_by_task = dict(
             data['next_environment_case_index_by_task'])
 
@@ -350,8 +381,14 @@ class DistributedEvaluationCoordinator:
             # a failed report must not leave an apparently finished job.
             evaluation_run.on_episode_end(result, job.episode_id)
             scheduling_state.results_by_episode_id[job.episode_id] = result
-            self._release_worker_slot(slot)
+            if not slot.current_group or all(
+                    member.episode_id in scheduling_state.results_by_episode_id
+                    for member in slot.current_group):
+                self._release_worker_slot(slot)
         elif message_type == 'environment_case_rejected':
+            if slot.current_group:
+                raise RuntimeError(
+                    'Native batch case rejection cannot be retried')
             job = self._require_assigned_job(slot, header)
             next_case_index = (
                 scheduling_state.next_environment_case_index_by_task.get(
@@ -412,6 +449,8 @@ class DistributedEvaluationCoordinator:
 
     def _replace_worker_connection(self, slot: _WorkerSlot, *,
                                    routing_id: bytes, generation: int) -> None:
+        if slot.current_group or slot.batch_size > 1:
+            raise RuntimeError('Native batch worker restart is not supported')
         job = slot.current_job
         if job is not None:
             self._requeue_restarted_job(job)
@@ -466,6 +505,8 @@ class DistributedEvaluationCoordinator:
                 f'simulator worker {slot.worker_id!r} changed its task '
                 'manifest after restart')
         slot.task_manifest = task_manifest
+        slot.batch_size = _positive_int(
+            body.get('batch_size', 1), 'batch_size')
         slot.recovery_deadline = None
         slot.simulator_ready = True
         slot.startup_restart_count = 0
@@ -479,6 +520,24 @@ class DistributedEvaluationCoordinator:
 
     def _dispatch_jobs(self) -> None:
         scheduling_state = self._require_scheduling_state()
+        if self._episode_batch_size > 1:
+            while scheduling_state.pending_jobs:
+                slot = self._next_idle_worker_slot()
+                if slot is None:
+                    return
+                group = tuple(scheduling_state.pending_jobs.popleft()
+                              for _ in range(self._episode_batch_size))
+                if any(job.task != group[0].task for job in group):
+                    raise RuntimeError('Native batch scheduling crossed tasks')
+                slot.current_group = group
+                slot.current_job = group[0]
+                slot.episode_deadline = self._new_episode_deadline()
+                self._send_worker_message(
+                    'episode_batch',
+                    slot,
+                    episode_ids=[job.episode_id for job in group],
+                    payload=encode_frame([to_jsonable(job) for job in group]))
+            return
         if self._strict_worker_assignment:
             # Use the stable task-major ordinal, not completion order, so
             # retries stay on the same worker for a given worker count. Scan
@@ -519,6 +578,7 @@ class DistributedEvaluationCoordinator:
 
     def _release_worker_slot(self, slot: _WorkerSlot) -> None:
         slot.current_job = None
+        slot.current_group = ()
         slot.episode_deadline = None
         self._idle_worker_ids.append(slot.worker_id)
 
@@ -531,8 +591,8 @@ class DistributedEvaluationCoordinator:
         scheduling_state = self._require_scheduling_state()
         episode_id = _required_string(header, 'episode_id')
         job = scheduling_state.jobs_by_episode_id.get(episode_id)
-        if (job is None or slot.current_job is None
-                or slot.current_job != job):
+        assigned = slot.current_group or (slot.current_job, )
+        if job is None or job not in assigned:
             raise RuntimeError(
                 f'worker {slot.worker_id} emitted an unassigned episode '
                 f'{episode_id!r}')
@@ -588,9 +648,12 @@ class DistributedEvaluationCoordinator:
 
     def _active_episode_progress(self) -> dict[str, Any] | None:
         jobs = [
-            slot.current_job.episode_start_payload(utc_now())
+            job.episode_start_payload(utc_now())
             for slot in self._worker_slots.values()
-            if slot.current_job is not None
+            for job in (slot.current_group or (slot.current_job, ))
+            if job is not None and (
+                self._scheduling_state is None or job.episode_id not in
+                self._scheduling_state.results_by_episode_id)
         ]
         return {'active_episodes': jobs} if jobs else None
 

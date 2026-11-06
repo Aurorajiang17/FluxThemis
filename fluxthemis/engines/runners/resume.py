@@ -63,7 +63,9 @@ def manifest(start):
     keys = ('base_seed', 'episodes_per_task', 'episodes_per_task_by_task',
             'max_episode_steps', 'execute_horizon', 'stop_on_success',
             'task_ids', 'tasks', 'total_episodes', 'strict_worker_assignment')
-    return {key: start.get(key) for key in keys}
+    value = {key: start.get(key) for key in keys}
+    value['episode_batch_size'] = start.get('episode_batch_size', 1)
+    return value
 
 
 def canonical_jobs(start):
@@ -189,6 +191,24 @@ def build_bundle(directory):
                 raise ValueError(f'Replayed result changed {field}')
     merged.update(completed)
     jobs = canonical_jobs(start)
+    # Native simulators reset and step a whole group. Reuse only complete
+    # groups; keep partial-group evidence in the source, irrespective of its
+    # success values. Replaying fewer lanes would change the batch protocol.
+    size = start.get('episode_batch_size', 1)
+    excluded = []
+    if size > 1:
+        groups = {}
+        for job in jobs:
+            group = job['task_id'], job['episode_index'] // size
+            groups.setdefault(group, []).append(identity(job))
+        for keys in groups.values():
+            if len(keys) != size:
+                raise ValueError(
+                    'Native resume requires complete batch quotas')
+            if not all(key in merged for key in keys):
+                for key in keys:
+                    if key in merged:
+                        excluded.append(merged.pop(key))
     used = {task: set() for task in start['task_ids']}
     # Reserve the actual completed layouts first: rejected defaults may have
     # been replaced with indexes that overlap another episode's default case.
@@ -237,6 +257,11 @@ def build_bundle(directory):
         next_environment_case_index_by_task=next_cases,
         elapsed_execution_s=inherited.get('elapsed_execution_s', 0.) + elapsed,
         source_journal_sha256=hashlib.sha256(journal.read_bytes()).hexdigest())
+    if size > 1:
+        bundle['native_batch_recovery'] = dict(
+            batch_size=size,
+            excluded_partial_group_results=excluded,
+            policy='reuse_complete_groups_restart_incomplete_groups')
     validate_bundle(bundle)
     return bundle
 
@@ -292,3 +317,18 @@ def validate_bundle(data):
             if datetime.fromisoformat(body[field]).tzinfo is None:
                 raise ValueError('Recovery timestamps need a timezone')
         done.add(key)
+    size = data['start'].get('episode_batch_size', 1)
+    if type(size) is not int or size < 1:
+        raise ValueError('Invalid recovery batch size')
+    if size > 1:
+        groups = {}
+        for key, job in jobs.items():
+            if job['environment_case_index'] != job['episode_index']:
+                raise ValueError('Native resume cannot replace layout indices')
+            group = job['task_id'], job['episode_index'] // size
+            groups.setdefault(group, []).append(key)
+        if any(
+                len(keys) != size or sum(key in done
+                                         for key in keys) not in (0, size)
+                for keys in groups.values()):
+            raise ValueError('Native resume requires whole completed groups')
