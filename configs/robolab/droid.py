@@ -23,7 +23,9 @@ themis = dict(
             simulator_seed=0,
             num_envs=1,
             headless=True),
-        policy_client=dict(type='FluxVLAPolicyClient'),
+        policy_client=dict(
+            type='FluxVLAPolicyClient',
+            sampling_mode='episode_noise_stream_v1'),
         reporter=dict(type='FluxVLAEvaluationReporter'),
         evaluator=dict(type='SuccessRateEvaluator'),
         base_seed=0,

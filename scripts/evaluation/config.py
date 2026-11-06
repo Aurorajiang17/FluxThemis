@@ -202,7 +202,8 @@ def load_config(path, *, mode=None, overrides=None):
             raise ValueError(
                 'Set a smoke task explicitly for this environment')
         task = smoke_tasks[kind]
-        episodes = total_workers
+        episodes = total_workers * integer(
+            evaluation.get('episode_batch_size', 1), 'episode_batch_size')
     elif mode == 'full':
         task, episodes = 'all', None
     if task is not None:
@@ -303,6 +304,25 @@ def load_config(path, *, mode=None, overrides=None):
         sim['save_videos'] if sim['save_videos'] is not None else
         evaluation.get('save_videos', False))
     evaluation.save_videos = save_videos
+    batch_size = integer(
+        evaluation.get('episode_batch_size', 1), 'episode_batch_size')
+    if kind == 'RoboLabEnvironment' and environment.get('num_envs',
+                                                        1) != batch_size:
+        raise ValueError('RoboLab num_envs must equal episode_batch_size')
+    if batch_size > 1:
+        if (scheduling != 'dynamic' or sim['simulator_restart_limit'] != 0
+                or save_videos):
+            raise ValueError('Native batches require dynamic scheduling, '
+                             'simulator_restart_limit=0 and no video')
+        quotas = [
+            evaluation.get('episodes_per_task', 1),
+            *evaluation.get('episodes_per_task_overrides', {}).values()
+        ]
+        if any(
+                type(count) is not int or count < 1 or count % batch_size
+                for count in quotas):
+            raise ValueError('Episode quotas must be positive multiples of '
+                             'episode_batch_size')
     local = dict(
         python=path_value(
             sim['python'], 'simulator.python', path.parent, resolve=False),

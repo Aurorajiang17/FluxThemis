@@ -8,6 +8,7 @@ the shared episode runner, respectively.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import logging
 import os
@@ -26,6 +27,7 @@ from fluxthemis.engines.utils import ENVIRONMENTS
 from fluxthemis.structures import StepResult, TaskSpec
 
 from ..base import BaseEnvironment
+from .robolab_metrics import collect_episode_metrics
 
 
 def _load_prelaunch_runtime():
@@ -66,9 +68,9 @@ def _load_postlaunch_runtime():
         select_instruction_fields=instructions.select_instruction_fields)
 
 
-def _launch_app(launcher, args, render_device_id):
+def _launch_app(launcher, args, render_device_id, cpu_thread_limit=None):
     """Keep one worker on one GPU, allowing distinct CUDA/Vulkan ordinals."""
-    if render_device_id is None:
+    if render_device_id is None and cpu_thread_limit is None:
         return launcher(args, multi_gpu=False)
     if not hasattr(launcher, '_create_app'):
         raise RuntimeError('Unsupported IsaacLab app creation interface')
@@ -83,8 +85,14 @@ def _launch_app(launcher, args, render_device_id):
             if (not isinstance(config, dict)
                     or not {'active_gpu', 'physics_gpu'} <= config.keys()):
                 raise RuntimeError('Unsupported IsaacLab GPU configuration')
-            config.update(
-                active_gpu=render_device_id, multi_gpu=False, max_gpu_count=1)
+            if render_device_id is not None:
+                config.update(
+                    active_gpu=render_device_id,
+                    multi_gpu=False,
+                    max_gpu_count=1)
+            if cpu_thread_limit is not None:
+                # Apply the native limit to Kit, TBB and USD/OpenBLAS.
+                config['limit_cpu_threads'] = cpu_thread_limit
             return super()._create_app()
 
     return RenderDeviceLauncher(args, multi_gpu=False)
@@ -96,6 +104,11 @@ def _nonnegative_integer(value, name):
     if value < 0:
         raise ValueError(f'{name} must be non-negative')
     return int(value)
+
+
+def _gpu_token(value):
+    return isinstance(value, str) and (value.isdecimal() or re.fullmatch(
+        r'GPU-[A-Za-z0-9-]+', value))
 
 
 def _numpy(value):
@@ -114,7 +127,7 @@ def _single(value, name):
 
 @ENVIRONMENTS.register_module()
 class RoboLabEnvironment(BaseEnvironment):
-    """Single-environment DROID adapter using the official task lifecycle.
+    """DROID adapter using the official scalar or native batch lifecycle.
 
     A worker owns one Isaac application. Consecutive episodes of the same task
     reuse the native environment; changing tasks closes and recreates it.
@@ -130,12 +143,15 @@ class RoboLabEnvironment(BaseEnvironment):
                  device_id: int = 0,
                  render_device_id: int | None = None,
                  kit_args: str = '',
+                 cpu_thread_limit: int | None = None,
                  headless: bool = True,
                  num_envs: int = 1,
                  camera_keys: Mapping[str, str] | None = None,
                  state_keys: Sequence[str] = ('arm_joint_pos', 'gripper_pos'),
                  renderer: str = 'realtime',
-                 rendering_mode: str | None = None) -> None:
+                 rendering_mode: str | None = None,
+                 render_device_map: Mapping[str, int] | None = None,
+                 kit_cache_root: str | os.PathLike | None = None) -> None:
         names = [task_name] if isinstance(task_name, str) else list(task_name)
         if not names or any(not isinstance(n, str) or not n.strip()
                             for n in names):
@@ -150,11 +166,48 @@ class RoboLabEnvironment(BaseEnvironment):
         self.render_device_id = (None if render_device_id is None
                                  else _nonnegative_integer(
                                      render_device_id, 'render_device_id'))
+        if render_device_map is not None:
+            if render_device_id is not None:
+                raise ValueError('Use render_device_map or render_device_id, '
+                                 'not both')
+            if not isinstance(render_device_map,
+                              Mapping) or not render_device_map:
+                raise ValueError(
+                    'render_device_map must be a nonempty mapping')
+            if any(not _gpu_token(key) for key in render_device_map):
+                raise ValueError('render_device_map keys must be GPU index '
+                                 'strings or UUIDs')
+            render_device_map = {
+                key: _nonnegative_integer(value, 'render_device_map value')
+                for key, value in render_device_map.items()
+            }
+        self.render_device_map = render_device_map
+        self._assigned_device = None
         if not isinstance(kit_args, str):
             raise TypeError('kit_args must be a string')
         self.kit_args = kit_args
-        if _nonnegative_integer(num_envs, 'num_envs') != 1:
-            raise ValueError('RoboLabEnvironment supports a single native env')
+        self.kit_cache_root = (None if kit_cache_root is None else
+                               Path(kit_cache_root).expanduser().resolve())
+        if self.kit_cache_root is not None:
+            # The pinned IsaacLab launcher splits kit_args on whitespace.
+            if any(char.isspace() for char in str(self.kit_cache_root)):
+                raise ValueError('kit_cache_root must not contain whitespace')
+            managed = {'--portable-root', '--/app/tokens/omni_global_logs'}
+            if any(
+                    arg.split('=', 1)[0] in managed
+                    for arg in kit_args.split()):
+                raise ValueError(
+                    'kit_cache_root conflicts with manual Kit paths')
+        self._cache_environment = {}
+        self._kit_cache_dir = None
+        self.cpu_thread_limit = (None if cpu_thread_limit is None
+                                 else _nonnegative_integer(
+                                     cpu_thread_limit, 'cpu_thread_limit'))
+        if self.cpu_thread_limit == 0:
+            raise ValueError('cpu_thread_limit must be positive')
+        self.batch_size = _nonnegative_integer(num_envs, 'num_envs')
+        if self.batch_size == 0:
+            raise ValueError('num_envs must be positive')
         if not isinstance(headless, bool):
             raise TypeError('headless must be a boolean')
         self.headless = headless
@@ -206,9 +259,12 @@ class RoboLabEnvironment(BaseEnvironment):
     def configure_simulator_device(self, device_id: str) -> None:
         self._require_unstarted()
         token = str(device_id)
-        if not (token.isdecimal()
-                or re.fullmatch(r'GPU-[A-Za-z0-9-]+', token)):
+        if not _gpu_token(token):
             raise ValueError('device_id must be a GPU index or UUID')
+        if (self.render_device_map is not None
+                and token not in self.render_device_map):
+            raise ValueError(
+                f'Assigned GPU {token!r} is absent from render_device_map')
         visible = os.environ.get('CUDA_VISIBLE_DEVICES')
         if visible is not None:
             devices = visible.split(',')
@@ -223,11 +279,57 @@ class RoboLabEnvironment(BaseEnvironment):
         else:
             raise ValueError('GPU UUID assignment requires '
                              'CUDA_VISIBLE_DEVICES')
+        if self.render_device_map is not None:
+            self.render_device_id = self.render_device_map[token]
+        self._assigned_device = token
+
+    def _prepare_kit_runtime(self):
+        """Isolate writable Kit paths before importing its optional runtime."""
+        if self.kit_cache_root is None:
+            return self.kit_args
+        self.kit_cache_root.mkdir(parents=True, exist_ok=True)
+        prefix = re.sub(r'[^A-Za-z0-9_.-]', '_',
+                        f'{self.run_id}_{self.worker_id}')[:100]
+        root = Path(
+            tempfile.mkdtemp(prefix=prefix + '_', dir=self.kit_cache_root))
+        self._kit_cache_dir = root
+        paths = {
+            'XDG_CACHE_HOME': 'cache',
+            'XDG_CONFIG_HOME': 'config',
+            'XDG_DATA_HOME': 'data',
+            'OPTIX_CACHE_PATH': 'optix',
+            '__GL_SHADER_DISK_CACHE_PATH': 'shader',
+        }
+        for key, name in paths.items():
+            path = root / name
+            path.mkdir()
+            self._cache_environment[key] = (os.environ.get(key), str(path))
+            os.environ[key] = str(path)
+        portable, logs = root / 'kit-portable', root / 'logs'
+        portable.mkdir()
+        logs.mkdir()
+        return (f'{self.kit_args} --portable-root {portable} '
+                f'--/app/tokens/omni_global_logs={logs}').strip()
+
+    def _restore_cache_environment(self):
+        for key, (previous, applied) in self._cache_environment.items():
+            if os.environ.get(key) != applied:
+                continue
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+        self._cache_environment.clear()
 
     def setup(self) -> None:
         if self._runtime is not None:
             return
         try:
+            if (self.render_device_map is not None
+                    and self._assigned_device is None):
+                raise ValueError(
+                    'render_device_map requires a worker GPU assignment')
+            kit_args = self._prepare_kit_runtime()
             root = self.robolab_root or os.environ.get('ROBOLAB_ROOT')
             if root is not None:
                 root = str(Path(root).expanduser().resolve())
@@ -244,8 +346,9 @@ class RoboLabEnvironment(BaseEnvironment):
             args.headless = self.headless
             args.enable_cameras = True
             args.device = f'cuda:{self.device_id}'
-            args.kit_args = self.kit_args
-            self._app = _launch_app(launcher, args, self.render_device_id).app
+            args.kit_args = kit_args
+            self._app = _launch_app(launcher, args, self.render_device_id,
+                                    self.cpu_thread_limit).app
             runtime = _load_postlaunch_runtime()
             selection = (None if self.task_names == ('all', ) else list(
                 self.task_names))
@@ -297,6 +400,8 @@ class RoboLabEnvironment(BaseEnvironment):
               environment_seed: int | None,
               environment_case_index: int | None) -> tuple[dict, dict]:
         self._require_setup()
+        if self.batch_size != 1:
+            raise RuntimeError('Use reset_batch for a native batch')
         if not isinstance(task, TaskSpec):
             raise TypeError('task must be a TaskSpec')
         if task.task_id not in self._task_ids:
@@ -334,6 +439,13 @@ class RoboLabEnvironment(BaseEnvironment):
                 simulator_seed=self.simulator_seed,
                 environment_instance=self._instance,
                 instance_episode=self._instance_episode,
+                native_hdf5_path=str(self._native_dir /
+                                     f'run_{self._instance_episode}.hdf5'),
+                initial_observation_sha256={
+                    key: hashlib.sha256(value.tobytes()).hexdigest()
+                    for key, value in observation.items()
+                    if isinstance(value, np.ndarray)
+                },
                 native_output_dir=str(self._native_dir),
                 native_max_episode_steps=self._max_steps)
             self._instance_episode += 1
@@ -354,16 +466,17 @@ class RoboLabEnvironment(BaseEnvironment):
             task_id,
             device=f'cuda:{self.device_id}',
             seed=self.simulator_seed,
-            num_envs=1,
+            num_envs=self.batch_size,
             instruction_type='default',
             renderer=self.renderer,
             rendering_mode=self.rendering_mode)
-        if self._env.num_envs != 1:
-            raise ValueError('RoboLab adapter requires a single native env')
+        if self._env.num_envs != self.batch_size:
+            raise ValueError('RoboLab native num_envs differs from batch_size')
         if self._env.action_manager.total_action_dim != 8:
             raise ValueError('DROID jointpos must expose 8 action values')
         self._max_steps = _nonnegative_integer(self._env.max_episode_length,
                                                'max_episode_length')
+        self._control_dt_s = float(cfg.sim.dt) * cfg.decimation
         if self._max_steps == 0:
             raise ValueError('max_episode_length must be positive')
         self._instruction = self._runtime.instruction_text(
@@ -372,29 +485,36 @@ class RoboLabEnvironment(BaseEnvironment):
         self._active_task_id = task_id
         self._instance_episode = 0
 
-    def _observation(self, raw):
+    def _observation(self, raw, env_id=0):
         if not isinstance(raw, Mapping):
             raise TypeError('RoboLab observation must be a mapping')
         flat = {}
         for output, source in self.camera_keys.items():
-            image = _numpy(raw['image_obs'][source])
-            if (image.ndim != 4 or image.shape[0] != 1 or image.shape[-1] != 3
-                    or min(image.shape[1:3]) == 0 or image.dtype != np.uint8):
-                raise ValueError(f'{source} must be [1,H,W,3] RGB uint8')
-            flat[output] = image[0].copy()
+            images = raw['image_obs'][source]
+            if (len(images.shape) != 4 or images.shape[0] != self.batch_size
+                    or images.shape[-1] != 3 or min(images.shape[1:3]) == 0):
+                raise ValueError(f'{source} must be [N,H,W,3] RGB uint8')
+            image = _numpy(images[env_id])
+            if image.dtype != np.uint8:
+                raise ValueError(f'{source} must be [N,H,W,3] RGB uint8')
+            flat[output] = image.copy()
         parts = []
         for key, width in zip(self.state_keys, (7, 1)):
-            part = _numpy(raw['proprio_obs'][key])
-            if (part.shape != (1, width) or part.dtype.kind not in 'fiu'
-                    or not np.isfinite(part).all()):
-                raise ValueError(f'{key} must be finite numeric [1,{width}]')
-            parts.append(part[0])
+            values = raw['proprio_obs'][key]
+            if tuple(values.shape) != (self.batch_size, width):
+                raise ValueError(f'{key} must be finite numeric [N,{width}]')
+            part = _numpy(values[env_id])
+            if (part.dtype.kind not in 'fiu' or not np.isfinite(part).all()):
+                raise ValueError(f'{key} must be finite numeric [N,{width}]')
+            parts.append(part)
         flat['states'] = np.concatenate(parts).copy()
         flat['task_description'] = self._instruction
         return flat
 
     def step(self, action: Any) -> StepResult:
         self._require_setup()
+        if self.batch_size != 1:
+            raise RuntimeError('Use step_batch for a native batch')
         if not self._episode_active:
             raise RuntimeError(
                 'Call reset(): episode has not started or ended')
@@ -437,9 +557,14 @@ class RoboLabEnvironment(BaseEnvironment):
         elif success is not None or native_result.get('step') is not None:
             raise RuntimeError('Unfrozen RoboLab env has an unexpected result')
         elif self._steps >= self._max_steps:
+            native_step = _single(self._env.episode_length_buf,
+                                  'episode_length_buf')
             raise RuntimeError(
                 'RoboLab reached the native outer-loop limit without a final '
-                f'result: steps={self._steps}, result={native_result}')
+                f'result: steps={self._steps}, result={native_result}, '
+                f'native_episode_step={native_step}, '
+                f'raw_terminated={_single(term, "terminated")}, '
+                f'raw_truncated={_single(trunc, "truncated")}')
         reward_value = float(_single(reward, 'reward'))
         if not np.isfinite(reward_value):
             raise ValueError('RoboLab reward is not finite')
@@ -452,6 +577,18 @@ class RoboLabEnvironment(BaseEnvironment):
             raw_truncated=bool(_single(trunc, 'truncated')),
             native_frozen=frozen,
             native_result=native_result)
+        score = None
+        if frozen:
+            try:
+                score, metrics_info = collect_episode_metrics(
+                    info['native_hdf5_path'], self._control_dt_s, success,
+                    int(native_result['step']))
+            except Exception as exc:
+                raise RuntimeError(
+                    f'RoboLab terminal metrics failed: native_result='
+                    f'{native_result}, hdf5={info["native_hdf5_path"]}: '
+                    f'{type(exc).__name__}: {exc}') from exc
+            info.update(metrics_info)
         self._last_observation = observation
         self._episode_active = not frozen
         return StepResult(
@@ -460,7 +597,18 @@ class RoboLabEnvironment(BaseEnvironment):
             terminated=frozen and success is True,
             truncated=frozen and success is False,
             success=success,
+            score=score,
             info=info)
+
+    def reset_batch(self, task, episode_indices, *, environment_seeds,
+                    environment_case_indices):
+        from .robolab_batch import reset_batch
+        return reset_batch(self, task, episode_indices, environment_seeds,
+                           environment_case_indices)
+
+    def step_batch(self, actions):
+        from .robolab_batch import step_batch
+        return step_batch(self, actions)
 
     def render(self):
         if self._last_observation is None:
@@ -491,6 +639,7 @@ class RoboLabEnvironment(BaseEnvironment):
                     if self._added_path in sys.path:
                         sys.path.remove(self._added_path)
                     self._added_path = None
+                self._restore_cache_environment()
 
     def _require_setup(self):
         if self._runtime is None:
