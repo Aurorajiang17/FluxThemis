@@ -64,6 +64,19 @@ bash scripts/install_robotwin.sh
 See [RoboTwin evaluation](docs/robotwin.md) for model and simulator startup,
 task selection and compatibility notes.
 
+For RoboLab DROID joint-position evaluation, first prepare its Python 3.11,
+IsaacLab/Isaac Sim environment and native assets, then install Themis there:
+
+```bash
+cd /path/to/FluxThemis
+python -m pip install -e .
+```
+
+See [RoboLab evaluation](docs/robolab.md) for dependency requirements, model
+service startup, native batching, device/cache configuration and explicit
+whole-batch recovery. RoboLab disables automatic simulator restart and uses
+the documented recovery path instead of the generic `--resume` command.
+
 Each simulator installer installs the FluxThemis package into its target
 environment. A separate core environment is not required for evaluation.
 
@@ -85,6 +98,11 @@ YAML such as [configs/robodojo/remote.yaml](configs/robodojo/remote.yaml) or
 [configs/robotwin/remote.yaml](configs/robotwin/remote.yaml).
 YAML holds paths, GPU/worker counts, connection settings and output locations;
 `--smoke` and `--full` select the evaluation scope using the same config.
+
+RoboLab provides [single-environment DROID](configs/robolab/droid.py),
+[native batching](configs/robolab/native_batch.py) and a
+[remote smoke template](configs/robolab/remote.yaml). Follow the
+[RoboLab guide](docs/robolab.md) for their matching model service and quotas.
 
 Existing FluxVLA configs remain usable: the evaluation launcher reads their
 Themis evaluation settings without loading model weights. A combined config
@@ -325,4 +343,5 @@ pre-commit run --all-files
 ```
 
 See [LIBERO](docs/libero.md), [RoboCasa](docs/robocasa.md),
-[RoboDojo](docs/robodojo.md), and [RoboTwin](docs/robotwin.md).
+[RoboDojo](docs/robodojo.md), [RoboTwin](docs/robotwin.md), and
+[RoboLab](docs/robolab.md).
