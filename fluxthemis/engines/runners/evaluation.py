@@ -38,6 +38,11 @@ class EvaluationSettings:
     stop_on_success: bool = True
     # Fixed assignment is opt-in; existing configs retain dynamic scheduling.
     strict_worker_assignment: bool = False
+    episode_batch_size: int = 1
+    # Scheduling priority only; canonical task/seed order remains unchanged.
+    task_schedule: Sequence[str] | None = None
+    # Optional canonical seed offsets for independently launched task shards.
+    task_seed_offsets: Mapping[str, int] = field(default_factory=dict)
     run_name: str | None = None
     episodes_per_task_overrides: Mapping[str,
                                          int] = field(default_factory=dict)
@@ -65,6 +70,25 @@ class EvaluationSettings:
             raise TypeError('stop_on_success must be a boolean')
         if not isinstance(self.strict_worker_assignment, bool):
             raise TypeError('strict_worker_assignment must be a boolean')
+        object.__setattr__(
+            self, 'episode_batch_size',
+            _positive_integer(self.episode_batch_size, 'episode_batch_size'))
+        object.__setattr__(self, 'task_schedule',
+                           _normalize_task_ids(self.task_schedule))
+        if self.episode_batch_size > 1:
+            if self.strict_worker_assignment:
+                raise ValueError('Native batches require dynamic scheduling')
+        if self.episode_batch_size > 1 and self.resume_path:
+            raise ValueError('Native batch resume is unsupported')
+        offsets = self.task_seed_offsets
+        if not isinstance(offsets, Mapping) or any(
+                not isinstance(k, str) or not k or type(v) is not int or v < 0
+                for k, v in offsets.items()):
+            raise ValueError(
+                'task_seed_offsets must map task IDs to nonnegative integers')
+        object.__setattr__(self, 'task_seed_offsets', dict(offsets))
+        if offsets and self.resume_path:
+            raise ValueError('Seed-mapped shards require a fresh evaluation')
         run_name = self.run_name or _default_run_name()
         _validate_run_name(run_name)
         object.__setattr__(self, 'run_name', run_name)
@@ -201,6 +225,11 @@ class EvaluationRun:
         payload['parallel_workers'] = worker_count
         payload['strict_worker_assignment'] = (
             self.settings.strict_worker_assignment)
+        payload['episode_batch_size'] = self.settings.episode_batch_size
+        payload['task_schedule'] = self.settings.task_schedule
+        if self.settings.task_seed_offsets:
+            payload['task_seed_offsets'] = dict(
+                self.settings.task_seed_offsets)
         if self.resume_data:
             # Config checks alone cannot detect a changed task inventory;
             # compare the tasks actually discovered by the simulator as well.

@@ -1,10 +1,12 @@
 """Common stages and acknowledged episode progress for all benchmarks."""
 
 import json
+import math
 import re
 import shutil
 import sys
 import time
+from pathlib import Path
 
 STAGES = ('Configuration', 'Simulator preflight', 'Model readiness',
           'Evaluation', 'Result validation')
@@ -225,3 +227,127 @@ class SimulatorStartupLog:
         if self.last_error:
             message += '; latest error: ' + self.last_error
         return message
+
+
+def validate_process_chain(records):
+    """Require one model instance and a complete sequence starting at one."""
+    instances, sequences = set(), []
+
+    def consume(metadata, record):
+        for ordinal, item in enumerate(metadata, 1):
+            if (item['sampling_mode'] != 'process_noise_stream_v1'
+                    or item['sequence'] != ordinal
+                    or item['episode_id'] != record['episode_id']
+                    or item['policy_seed'] != record['policy_seed']
+                    or not item['process_instance_id']
+                    or type(item['process_sequence']) is not int):
+                raise ValueError('Model request identity differs')
+            instances.add(item['process_instance_id'])
+            sequences.append(item['process_sequence'])
+
+    for record in records:
+        metadata = record['prediction_metadata']
+        if not metadata or len(metadata) != record['model_calls']:
+            raise ValueError('Missing model request metadata')
+        consume(metadata, record)
+    if len(instances) != 1 or sorted(sequences) != list(
+            range(1,
+                  len(sequences) + 1)):
+        raise ValueError(
+            'Process changed or request sequence has gaps/duplicates')
+    return instances.pop()
+
+
+def stream_results(settings, row):
+    directory = Path(row['directory'])
+    pointer = json.loads((directory / 'result-pointer.json').read_text())
+    local = Path(pointer['directory'])
+    result = json.loads((local / 'result.json').read_text())
+    events = Events()
+    events.read(local / 'events.jsonl')
+    computed = events.result(result['simulator_exit_code'])
+    if events.pending or not computed['complete'] or not result['complete']:
+        raise ValueError('Incomplete stream journal')
+    if any(computed[k] != result[k]
+           for k in ('completed', 'total', 'successes', 'remote_result_dir')):
+        raise ValueError('Result summary disagrees with journal')
+    model_root = (directory / 'model-results').resolve()
+    remote = Path(events.run_dir).resolve()
+    if model_root not in remote.parents:
+        raise ValueError(
+            'Model journal is outside this stream result directory')
+    left = [
+        json.loads(line)
+        for line in (local / 'events.jsonl').read_text().splitlines()
+    ]
+    right = [
+        json.loads(line)
+        for line in (remote / 'events.jsonl').read_text().splitlines()
+    ]
+    fields = ('event_type', 'sequence', 'run_session_id', 'payload')
+    if [[e[k] for k in fields] for e in left] != [[e[k] for k in fields]
+                                                  for e in right]:
+        raise ValueError('Model and simulator journals disagree')
+    if left[0]['event_type'] != 'run_start' or left[-1][
+            'event_type'] != 'run_end':
+        raise ValueError('Missing terminal event boundary')
+    start = left[0]['payload']
+    if [t['task_id'] for t in start['tasks']] != row['tasks']:
+        raise ValueError('Started task order differs from planned stream')
+    records = list(events.episodes.values())
+    batch = settings['batch_size']
+    expected = {(task, lane) for task in row['tasks'] for lane in range(batch)}
+    identities = [(r['task_id'], r['episode_index']) for r in records]
+    if len(identities) != len(expected) or set(identities) != expected:
+        raise ValueError('Duplicate, missing or unexpected task/lane identity')
+    for record in records:
+        task, lane = record['task_id'], record['episode_index']
+        seed = settings['report_base_seed'] + batch * settings['manifest'][
+            'canonical_tasks'].index(task) + lane
+        if record['policy_seed'] != seed or record['environment_seed'] != seed:
+            raise ValueError('Canonical task/lane seed differs')
+        if type(record['success']) is not bool or type(
+                record['score']) not in (int, float) or not math.isfinite(
+                    record['score']):
+            raise ValueError('Episode success/Score is missing or invalid')
+    return records, validate_process_chain(records)
+
+
+def collect_results(plan):
+    repeats, all_instances = {}, set()
+    for seed in plan['settings']['process_seeds']:
+        records = {}
+        for row in (r for r in plan['streams'] if r['seed'] == seed):
+            values, instance = stream_results(plan['settings'], row)
+            if instance in all_instances:
+                raise ValueError(
+                    'Independent streams shared one model process')
+            all_instances.add(instance)
+            for value in values:
+                key = (value['task_id'], value['episode_index'])
+                if key in records:
+                    raise ValueError('Duplicate task/lane across streams')
+                records[key] = value
+        settings = plan['settings']
+        expected = {(t, i)
+                    for t in settings['manifest']['canonical_tasks']
+                    for i in range(settings['batch_size'])}
+        if set(records) != expected:
+            raise ValueError(
+                'Final episode coverage differs from requested manifest')
+        values = [
+            records[(t, i)] for t in settings['manifest']['canonical_tasks']
+            for i in range(settings['batch_size'])
+        ]
+        successes = sum(r['success'] for r in values)
+        repeats[str(seed)] = dict(
+            completed=len(values),
+            successes=successes,
+            success_rate=successes / len(values),
+            score=sum(r['score'] for r in values) / len(values))
+        write_json(
+            Path(plan['directory']) / f'episodes-seed-{seed}.json', values)
+    write_json(
+        Path(plan['directory']) / 'summary.json',
+        dict(repeats=repeats, status='complete'))
+    return repeats

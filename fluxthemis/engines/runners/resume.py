@@ -67,6 +67,8 @@ def manifest(start):
 
 
 def canonical_jobs(start):
+    if start.get('episode_batch_size', 1) != 1:
+        raise ValueError('Native batch resume is unsupported')
     task_ids = [task['task_id'] for task in start['tasks']]
     counts = start['episodes_per_task_by_task']
     if (task_ids != start['task_ids'] or not task_ids
