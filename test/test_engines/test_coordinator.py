@@ -1,12 +1,19 @@
+import pytest
+
 from fluxthemis.engines.runners.coordinator import (
     DistributedEvaluationCoordinator, _SchedulingState, _WorkerSlot)
-from fluxthemis.engines.runners.episode import build_episode_jobs
+from fluxthemis.engines.runners.episode import (build_episode_jobs,
+                                                execute_episode)
 from fluxthemis.engines.runners.evaluation import (EvaluationRun,
                                                    EvaluationSettings)
+from fluxthemis.engines.utils import to_jsonable
+from fluxthemis.environments.mock import MockEnvironment
 from fluxthemis.evaluators import SuccessRateEvaluator
+from fluxthemis.model_clients.mock import MockPolicyClient
 from fluxthemis.reporters import MockEvaluationReporter
 from fluxthemis.structures import TaskSpec
-from fluxthemis.transports.zmq_protocol import empty_payload, encode_header
+from fluxthemis.transports.zmq_protocol import (empty_payload, encode_frame,
+                                                encode_header)
 
 
 class _RouterSocket:
@@ -124,3 +131,187 @@ def test_reconnecting_worker_requeues_active_episode():
     assert slot.generation == 1
     assert slot.recovery_deadline is not None
     assert coordinator._worker_router.sent == []
+
+
+@pytest.mark.parametrize('field,value', [
+    ('deployment_id', 'other'),
+    ('episode_id', 'other'),
+    ('generation', 1),
+    ('worker_id', 'unknown'),
+])
+def test_coordinator_rejects_wrong_active_identity(field, value):
+    job = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')[0]
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(job)
+    state = _SchedulingState.from_jobs([job])
+    coordinator._scheduling_state = state
+    header = dict(
+        deployment_id='deployment',
+        worker_id=slot.worker_id,
+        generation=0,
+        episode_id=job.episode_id)
+    header[field] = value
+    coordinator._worker_router.incoming = [
+        slot.routing_id,
+        encode_header('episode_start', **header),
+        empty_payload()
+    ]
+    with pytest.raises(RuntimeError):
+        coordinator._receive_worker_message(evaluation_run)
+    assert state.started_episode_ids == set()
+    assert state.results_by_episode_id == {}
+
+
+def test_old_generation_cannot_complete_current_job():
+    job = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')[0]
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(job)
+    slot.generation = 1
+    state = _SchedulingState.from_jobs([job])
+    coordinator._scheduling_state = state
+    coordinator._worker_router.incoming = [
+        b'old-worker-route',
+        encode_header(
+            'episode_end',
+            deployment_id='deployment',
+            worker_id=slot.worker_id,
+            generation=0,
+            episode_id=job.episode_id),
+        empty_payload()
+    ]
+    coordinator._receive_worker_message(evaluation_run)
+    assert slot.current_job == job
+    assert state.results_by_episode_id == {}
+
+
+@pytest.mark.parametrize('startup', [False, True])
+def test_restart_limit_zero_rejects_first_restart(startup):
+    job = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')[0]
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(job)
+    coordinator.simulator_restart_limit = 0
+    coordinator._scheduling_state = _SchedulingState.from_jobs([job])
+    if startup:
+        slot.current_job = None
+        slot.simulator_ready = False
+    coordinator._worker_router.incoming = [
+        b'worker-0:1',
+        encode_header(
+            'register_worker',
+            deployment_id='deployment',
+            worker_id=slot.worker_id,
+            generation=1,
+            device='0'),
+        empty_payload()
+    ]
+    with pytest.raises(RuntimeError, match='restart limit 0'):
+        coordinator._receive_worker_message(evaluation_run)
+
+
+def test_batch_releases_worker_only_after_last_acknowledged_result(
+        monkeypatch):
+    jobs = build_episode_jobs([TaskSpec('task')], 3, 7, 'run')
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(jobs[0])
+    state = _SchedulingState.from_jobs(jobs)
+    state.pending_jobs.clear()
+    coordinator._scheduling_state = state
+    slot.current_group = jobs
+    slot.batch_size = 3
+    acknowledged = []
+    monkeypatch.setattr(evaluation_run, 'on_episode_end',
+                        lambda result, eid: acknowledged.append(eid))
+    environment = MockEnvironment(tasks=['task'], success_after=1)
+    environment.setup()
+    for job in (jobs[2], jobs[0], jobs[1]):
+        result = execute_episode(environment, MockPolicyClient(action_dim=8),
+                                 job, 2, None, True)
+        coordinator._worker_router.incoming = [
+            slot.routing_id,
+            encode_header(
+                'episode_end',
+                deployment_id='deployment',
+                worker_id=slot.worker_id,
+                generation=0,
+                episode_id=job.episode_id),
+            encode_frame(to_jsonable(result))
+        ]
+        coordinator._receive_worker_message(evaluation_run)
+        assert slot.is_idle == (len(acknowledged) == 3)
+        if len(acknowledged) < 3:
+            with pytest.raises(RuntimeError, match='duplicate'):
+                coordinator._receive_worker_message(evaluation_run)
+    assert not slot.current_group
+    assert list(coordinator._idle_worker_ids) == [slot.worker_id]
+    environment.close()
+
+
+def test_native_batch_configuration_rejects_incomplete_and_restarted_runs():
+    jobs = build_episode_jobs([TaskSpec('task')], 3, 7, 'run')
+    coordinator, slot, _ = _coordinator_with_active_job(jobs[0])
+    slot.batch_size = 3
+    settings = EvaluationSettings(episode_batch_size=3)
+    with pytest.raises(ValueError, match='restart_limit=0'):
+        coordinator._configure_batches(settings, jobs)
+    coordinator.simulator_restart_limit = 0
+    coordinator._configure_batches(settings, jobs)
+    wrong_quota = build_episode_jobs([TaskSpec('task')], 4, 7, 'run')
+    with pytest.raises(ValueError, match='divisible'):
+        coordinator._configure_batches(settings, wrong_quota)
+    assert EvaluationSettings(
+        episode_batch_size=3, resume_path='old').resume_path
+    with pytest.raises(ValueError, match='dynamic'):
+        EvaluationSettings(episode_batch_size=3, strict_worker_assignment=True)
+    with pytest.raises(RuntimeError, match='restart'):
+        coordinator._replace_worker_connection(
+            slot, routing_id=b'new', generation=1)
+
+
+def test_batch_dispatch_preserves_seeds_and_same_task_groups():
+    from collections import deque
+    jobs = build_episode_jobs([TaskSpec('a'), TaskSpec('b')], 3, 7, 'run')
+    coordinator, slot, _ = _coordinator_with_active_job(jobs[0])
+    coordinator._episode_batch_size = 3
+    state = _SchedulingState.from_jobs(jobs)
+    # Scheduling priority can differ from canonical seed assignment.
+    state.pending_jobs = deque(jobs[3:] + jobs[:3])
+    coordinator._scheduling_state = state
+    slot.current_job = None
+    coordinator._idle_worker_ids.append(slot.worker_id)
+    coordinator._dispatch_jobs()
+    assert slot.current_group == jobs[3:]
+    assert [j.policy_seed for j in slot.current_group] == [10, 11, 12]
+    assert tuple(state.pending_jobs) == jobs[:3]
+    assert len(coordinator._worker_router.sent) == 1
+
+
+def test_report_failure_does_not_complete_or_release_job(monkeypatch):
+    job = build_episode_jobs([TaskSpec('task')], 1, 7, 'run')[0]
+    coordinator, slot, evaluation_run = _coordinator_with_active_job(job)
+    state = _SchedulingState.from_jobs([job])
+    coordinator._scheduling_state = state
+    environment = MockEnvironment(tasks=['task'], success_after=1)
+    environment.setup()
+    result = execute_episode(
+        environment=environment,
+        policy_client=MockPolicyClient(action_dim=8),
+        job=job,
+        max_episode_steps=2,
+        execute_horizon=None,
+        stop_on_success=True)
+    environment.close()
+    coordinator._worker_router.incoming = [
+        slot.routing_id,
+        encode_header(
+            'episode_end',
+            deployment_id='deployment',
+            worker_id=slot.worker_id,
+            generation=0,
+            episode_id=job.episode_id),
+        encode_frame(to_jsonable(result))
+    ]
+
+    def reject_report(*args):
+        raise RuntimeError('report not acknowledged')
+
+    monkeypatch.setattr(evaluation_run, 'on_episode_end', reject_report)
+    with pytest.raises(RuntimeError, match='report not acknowledged'):
+        coordinator._receive_worker_message(evaluation_run)
+    assert slot.current_job == job
+    assert state.results_by_episode_id == {}

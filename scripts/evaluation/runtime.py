@@ -22,7 +22,11 @@ class ProcessTree:
     @staticmethod
     def snapshot():
         rows = {}
-        for path in Path('/proc').glob('[0-9]*/stat'):
+        # Avoid glob's exists/stat checks while short-lived processes exit.
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            path = Path('/proc') / name / 'stat'
             try:
                 fields = path.read_text().rsplit(')', 1)[1].split()
                 if fields[0] == 'Z':
@@ -92,6 +96,8 @@ class ProcessRunner:
             self.env['ROBODOJO_ROOT'] = plan['local']['robodojo_root']
         if plan['local'].get('robotwin_root'):
             self.env['ROBOTWIN_ROOT'] = plan['local']['robotwin_root']
+        if plan['local'].get('robolab_root'):
+            self.env['ROBOLAB_ROOT'] = plan['local']['robolab_root']
         if plan['local'].get('cache'):
             self.env['XDG_CACHE_HOME'] = plan['local']['cache']
         self.env.pop('NPROC_PER_NODE', None)

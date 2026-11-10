@@ -190,6 +190,18 @@ def main(argv=None) -> int:
         overrides['themis.evaluation.save_videos'] = True
     if args.workers_per_gpu < 1:
         raise ValueError('workers-per-gpu must be positive')
+    from fluxthemis.engines.runners.config import \
+        load_distributed_evaluation_config
+    evaluation = load_distributed_evaluation_config(config_path, overrides)
+    if evaluation['policy_client'].get(
+            'sampling_mode') == 'process_noise_stream_v1':
+        if world_size != 1 or args.workers_per_gpu != 1:
+            raise ValueError(
+                'Process sampling requires one simulator worker per endpoint')
+        if args.simulator_restart_limit or evaluation.get('resume_path'):
+            raise ValueError(
+                'Process sampling requires explicit RNG state recovery; '
+                'disable restart/resume')
     if args.dry_run:
         import importlib
 

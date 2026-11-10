@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from collections.abc import Mapping
@@ -32,7 +33,15 @@ _POLICY_TRANSPORT_FIELDS = CONNECTION_TRANSPORT_FIELDS | frozenset({
 class FluxVLAPolicyClient(BasePolicyClient):
     """Synchronous policy client backed by the FluxVLA model service."""
 
-    def __init__(self, transport: Mapping[str, Any]) -> None:
+    def __init__(self,
+                 transport: Mapping[str, Any],
+                 sampling_mode: str = 'legacy_episode') -> None:
+        if sampling_mode not in {
+                'legacy_episode', 'episode_noise_stream_v1',
+                'process_noise_stream_v1'
+        }:
+            raise ValueError('Unsupported sampling_mode')
+        self.sampling_mode = sampling_mode
         if not isinstance(transport, Mapping):
             raise TypeError('transport must be a mapping')
         values = dict(transport)
@@ -62,7 +71,13 @@ class FluxVLAPolicyClient(BasePolicyClient):
         self._episode_id: str | None = None
         self._policy_seed: int | None = None
         self._prediction_sequence = 0
+        self._rng_state: bytes | None = None
+        self._rng_format: str | None = None
         self.last_profile: dict[str, float] = {}
+        # Deliberately retained across reset/set_episode_id: resets cannot hide
+        # a restarted or rerouted service from a process-continuous client.
+        self._process_instance_id: str | None = None
+        self._process_sequence = 0
 
     def setup(self) -> None:
         self.transport.setup()
@@ -84,6 +99,7 @@ class FluxVLAPolicyClient(BasePolicyClient):
         self._episode_id = f'{task.task_id}:{int(episode_index)}'
         self._policy_seed = int(policy_seed)
         self._prediction_sequence = 0
+        self._rng_state = self._rng_format = None
 
     def set_episode_id(self, episode_id: str) -> None:
         episode_id = nonempty_string(episode_id, 'episode_id')
@@ -92,6 +108,7 @@ class FluxVLAPolicyClient(BasePolicyClient):
                 'reset() must be called before set_episode_id()')
         self._episode_id = episode_id
         self._prediction_sequence = 0
+        self._rng_state = self._rng_format = None
 
     def predict_action(self, observation: Any,
                        context: Mapping[str, Any]) -> ActionChunk:
@@ -103,6 +120,7 @@ class FluxVLAPolicyClient(BasePolicyClient):
 
         started = time.perf_counter()
         request_id = uuid.uuid4().hex
+        input_state_hash = self._state_hash()
         self._prediction_sequence += 1
         header, payload = self._build_request(request_id, observation, context)
         response_header, response_payload = self.transport.request(
@@ -124,6 +142,12 @@ class FluxVLAPolicyClient(BasePolicyClient):
                 'episode_id': self._episode_id,
                 'sequence': self._prediction_sequence,
                 'policy_seed': self._policy_seed,
+                'sampling_mode': self.sampling_mode,
+                'process_instance_id': self._process_instance_id,
+                'process_sequence': self._process_sequence,
+                'sampling_rng_format': self._rng_format,
+                'input_rng_state_sha256': input_state_hash,
+                'output_rng_state_sha256': self._state_hash(),
                 'denormalized': True,
             },
         )
@@ -135,6 +159,11 @@ class FluxVLAPolicyClient(BasePolicyClient):
         self._episode_id = None
         self._policy_seed = None
         self._prediction_sequence = 0
+        self._rng_state = self._rng_format = None
+
+    def _state_hash(self) -> str | None:
+        return (hashlib.sha256(self._rng_state).hexdigest()
+                if self._rng_state is not None else None)
 
     def _ensure_ready(self) -> None:
         if any(
@@ -162,6 +191,16 @@ class FluxVLAPolicyClient(BasePolicyClient):
         payload = dict(images)
         payload.update(state)
         payload['task_description'] = prompt
+        sampling = {}
+        if self.sampling_mode in {
+                'episode_noise_stream_v1', 'process_noise_stream_v1'
+        }:
+            sampling = dict(
+                sampling_mode=self.sampling_mode,
+                rng_state=self._rng_state,
+                rng_format=self._rng_format)
+        if self.sampling_mode == 'process_noise_stream_v1':
+            sampling['task_id'] = self._task.task_id
         header = encode_header(
             'predict_action',
             deployment_id=self.transport.server_deployment_id,
@@ -171,6 +210,7 @@ class FluxVLAPolicyClient(BasePolicyClient):
             sequence=self._prediction_sequence,
             deadline_ms=int(self.transport.request_timeout_s * 1000),
             unnorm_key=unnorm_key,
+            **sampling,
         )
         return header, encode_frame(payload)
 
@@ -182,11 +222,54 @@ class FluxVLAPolicyClient(BasePolicyClient):
         body = decode_frame(payload)
         if not isinstance(body, Mapping) or body.get('actions') is None:
             raise RuntimeError('FluxVLA predict response missing actions')
-        actions = np.asarray(body['actions'], dtype=np.float32)
+        _validate_action_type(body['actions'])
+        actions = np.asarray(body['actions'])
         if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[1] == 0:
             raise RuntimeError(
                 f'FluxVLA actions must have shape [T, A], got {actions.shape}')
-        return actions, float(header.get('inference_time_s', 0.0))
+        if not np.isfinite(actions).all():
+            raise RuntimeError('FluxVLA returned NaN or infinite actions')
+        with np.errstate(over='ignore'):
+            actions = actions.astype(np.float32, copy=False)
+        if not np.isfinite(actions).all():
+            raise RuntimeError('FluxVLA actions are outside the FP32 range')
+        inference_time_s = float(header.get('inference_time_s', 0.0))
+        if self.sampling_mode == 'episode_noise_stream_v1':
+            if (header.get('sampling_mode') != self.sampling_mode
+                    or header.get('episode_id') != self._episode_id
+                    or type(header.get('sequence')) is not int
+                    or header['sequence'] != self._prediction_sequence):
+                raise RuntimeError(
+                    'FluxVLA sampling response identity mismatch')
+            state, fmt = body.get('rng_state'), body.get('rng_format')
+            if (not isinstance(state, bytes) or not 0 < len(state) <= 65536
+                    or not isinstance(fmt, str) or not fmt or len(fmt) > 512):
+                raise RuntimeError('FluxVLA response missing valid RNG state')
+            if self._rng_format is not None and fmt != self._rng_format:
+                raise RuntimeError('FluxVLA RNG format changed within episode')
+            if self._rng_state is not None and len(state) != len(
+                    self._rng_state):
+                raise RuntimeError('FluxVLA RNG state length changed')
+            self._rng_state, self._rng_format = state, fmt
+        if self.sampling_mode == 'process_noise_stream_v1':
+            instance = header.get('process_instance_id')
+            ordinal = header.get('process_sequence')
+            if (header.get('sampling_mode') != self.sampling_mode
+                    or header.get('episode_id') != self._episode_id
+                    or type(header.get('sequence')) is not int
+                    or header['sequence'] != self._prediction_sequence
+                    or not isinstance(instance, str) or not instance
+                    or type(ordinal) is not int
+                    or ordinal <= self._process_sequence):
+                raise RuntimeError(
+                    'FluxVLA process sampling response mismatch')
+            if (self._process_instance_id is not None
+                    and instance != self._process_instance_id):
+                raise RuntimeError(
+                    'FluxVLA process stream restarted or changed worker')
+            self._process_instance_id = instance
+            self._process_sequence = ordinal
+        return actions, inference_time_s
 
     @staticmethod
     def _resolve_prompt(context: Mapping[str, Any]) -> str:
@@ -232,6 +315,15 @@ class FluxVLAPolicyClient(BasePolicyClient):
             raise ValueError(
                 f'Observation state {name!r} contains NaN or infinity')
         return state
+
+
+def _validate_action_type(value: Any) -> None:
+    # A mixed Python sequence can lose its bool elements during coercion.
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _validate_action_type(item)
+    elif np.asarray(value).dtype.kind not in 'fiu':
+        raise TypeError('FluxVLA actions must contain real numbers')
 
 
 __all__ = ['FluxVLAPolicyClient']

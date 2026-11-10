@@ -103,6 +103,7 @@ def load_config(path, *, mode=None, overrides=None):
             config=str(path) if path.suffix == '.py' else None,
             robodojo_root=None,
             robotwin_root=None,
+            robolab_root=None,
             assets=None,
             gpu_ids=None,
             workers_per_gpu=1,
@@ -110,6 +111,8 @@ def load_config(path, *, mode=None, overrides=None):
             episodes=None,
             cache=None,
             coordinator_port=15558,
+            episode_timeout_s=3600,
+            simulator_restart_limit=3,
             scheduling=None,
             save_videos=None))
     model = mapping(
@@ -190,6 +193,7 @@ def load_config(path, *, mode=None, overrides=None):
     if mode == 'smoke':
         smoke_tasks = {
             'RoboDojoEnvironment': 'put_bottles_into_dustbin',
+            'RoboLabEnvironment': 'BananaInBowlTask',
             'LiberoEnvironment': '0'
         }
         if robotwin_tasks:
@@ -198,7 +202,8 @@ def load_config(path, *, mode=None, overrides=None):
             raise ValueError(
                 'Set a smoke task explicitly for this environment')
         task = smoke_tasks[kind]
-        episodes = total_workers
+        episodes = total_workers * integer(
+            evaluation.get('episode_batch_size', 1), 'episode_batch_size')
     elif mode == 'full':
         task, episodes = 'all', None
     if task is not None:
@@ -209,7 +214,7 @@ def load_config(path, *, mode=None, overrides=None):
                 r'[A-Za-z0-9_]+', task)
         if not valid_task:
             raise ValueError('simulator.task must be a task ID or all')
-        if kind == 'RoboDojoEnvironment':
+        if kind in ('RoboDojoEnvironment', 'RoboLabEnvironment'):
             environment.task_name = task
             evaluation.task_ids = None
         else:
@@ -230,7 +235,7 @@ def load_config(path, *, mode=None, overrides=None):
                      if t.strip()] if isinstance(selected, str) else selected)
         if any(t not in robotwin_tasks for t in selected):
             raise ValueError('RoboTwin task_ids must belong to task_suite')
-    robodojo_root = robotwin_root = assets = None
+    robodojo_root = robotwin_root = robolab_root = assets = None
     if kind == 'RoboDojoEnvironment':
         value = sim['robodojo_root'] or environment.get(
             'robodojo_root') or os.environ.get('ROBODOJO_ROOT') or str(
@@ -253,6 +258,14 @@ def load_config(path, *, mode=None, overrides=None):
         environment.robotwin_root = robotwin_root
     elif sim['robotwin_root'] is not None:
         raise ValueError('robotwin_root launch field applies only to RoboTwin')
+    if kind == 'RoboLabEnvironment':
+        value = sim['robolab_root'] or environment.get(
+            'robolab_root') or os.environ.get('ROBOLAB_ROOT') or str(
+                ROOT.parent / 'RoboLab')
+        robolab_root = path_value(value, 'simulator.robolab_root', path.parent)
+        environment.robolab_root = robolab_root
+    elif sim['robolab_root'] is not None:
+        raise ValueError('robolab_root launch field applies only to RoboLab')
     coord = integer(
         sim['coordinator_port'], 'simulator.coordinator_port', maximum=65534)
     endpoint = overrides.get('server_endpoint')
@@ -291,12 +304,45 @@ def load_config(path, *, mode=None, overrides=None):
         sim['save_videos'] if sim['save_videos'] is not None else
         evaluation.get('save_videos', False))
     evaluation.save_videos = save_videos
+    batch_size = integer(
+        evaluation.get('episode_batch_size', 1), 'episode_batch_size')
+    if kind == 'RoboLabEnvironment' and environment.get('num_envs',
+                                                        1) != batch_size:
+        raise ValueError('RoboLab num_envs must equal episode_batch_size')
+    if batch_size > 1:
+        if (scheduling != 'dynamic' or sim['simulator_restart_limit'] != 0
+                or save_videos):
+            raise ValueError('Native batches require dynamic scheduling, '
+                             'simulator_restart_limit=0 and no video')
+        quotas = [
+            evaluation.get('episodes_per_task', 1),
+            *evaluation.get('episodes_per_task_overrides', {}).values()
+        ]
+        if any(
+                type(count) is not int or count < 1 or count % batch_size
+                for count in quotas):
+            raise ValueError('Episode quotas must be positive multiples of '
+                             'episode_batch_size')
+    process_stream = evaluation.get(
+        'policy_client', {}).get('sampling_mode') == 'process_noise_stream_v1'
+    if process_stream:
+        if total_workers != 1 or model['expected_workers'] not in (None, 1):
+            raise ValueError('Process sampling requires one model and '
+                             'simulator worker per endpoint')
+        if resume['from_dir'] or evaluation.get('resume_path'):
+            raise ValueError(
+                'Process sampling requires explicit RNG state recovery')
+        if sim['simulator_restart_limit'] != 0:
+            raise ValueError(
+                'Process sampling requires simulator_restart_limit=0')
+        model['expected_workers'] = 1
     local = dict(
         python=path_value(
             sim['python'], 'simulator.python', path.parent, resolve=False),
         config=config_path,
         robodojo_root=robodojo_root,
         robotwin_root=robotwin_root,
+        robolab_root=robolab_root,
         assets=assets,
         cache=path_value(sim['cache'], 'simulator.cache', path.parent)
         if sim['cache'] else None,
@@ -305,6 +351,12 @@ def load_config(path, *, mode=None, overrides=None):
         task=task,
         episodes=episodes,
         port=coord,
+        episode_timeout_s=integer(sim['episode_timeout_s'],
+                                  'simulator.episode_timeout_s'),
+        simulator_restart_limit=integer(
+            sim['simulator_restart_limit'],
+            'simulator.simulator_restart_limit',
+            minimum=0),
         scheduling=scheduling,
         environment_type=kind,
         save_videos=save_videos)

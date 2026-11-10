@@ -1,0 +1,27 @@
+# Default RoboLab process-stream entry. Edit host-specific paths and devices.
+version: 1
+fluxvla_root: ${FLUXVLA_ROOT}
+model_python: ${FLUXVLA_PYTHON}
+simulator_python: ${FLUXTHEMIS_PYTHON}
+robolab_root: ${ROBOLAB_ROOT}
+output_root: ${ROBOLAB_EVAL_OUTPUT}
+cache_root: ${ROBOLAB_EVAL_CACHE}
+model_config: ${FLUXVLA_ROOT}/configs/pi05/pi05_paligemma_robolab_droid_jointpos_process_inference.py
+simulator_config: native_batch_process.py
+tasks: all
+num_streams: 1  # Independent persistent model streams; assigned round-robin to GPUs.
+report_base_seed: 0
+streams: null  # Optional explicit JSON task/order manifest for a deployment.
+process_seeds: [0]
+gpu_ids: [0]  # Available physical GPUs; complete logical streams queue on them.
+# Verify Vulkan ordinals against the selected GPUs before running.
+render_devices: [0]
+cpus_per_gpu: 8
+cpu_base: 0
+port_base: 20800
+startup_timeout_s: 1200
+episode_timeout_s: 3600
+stream_timeout_s: 21600
+allow_root: false
+model_env: {}
+simulator_env: {}

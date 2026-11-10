@@ -79,6 +79,8 @@ def run_distributed_evaluation_rank(*,
             deployment_id=deployment_id,
             device=device,
             episode_timeout_s=episode_timeout_s,
+            startup_timeout_s=startup_timeout_s,
+            restart_limit=simulator_restart_limit,
             config_overrides=config_overrides,
         ).run()
     except BaseException:

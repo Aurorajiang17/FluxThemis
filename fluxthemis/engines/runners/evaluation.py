@@ -38,6 +38,14 @@ class EvaluationSettings:
     stop_on_success: bool = True
     # Fixed assignment is opt-in; existing configs retain dynamic scheduling.
     strict_worker_assignment: bool = False
+    episode_batch_size: int = 1
+    # Explicit worker-local budget, in extra full native batches.
+    nonfinite_batch_retry_limit: int = 0
+    nonfinite_batch_retry_budget: int = 0
+    # Scheduling priority only; canonical task/seed order remains unchanged.
+    task_schedule: Sequence[str] | None = None
+    # Optional canonical seed offsets for independently launched task shards.
+    task_seed_offsets: Mapping[str, int] = field(default_factory=dict)
     run_name: str | None = None
     episodes_per_task_overrides: Mapping[str,
                                          int] = field(default_factory=dict)
@@ -65,6 +73,30 @@ class EvaluationSettings:
             raise TypeError('stop_on_success must be a boolean')
         if not isinstance(self.strict_worker_assignment, bool):
             raise TypeError('strict_worker_assignment must be a boolean')
+        object.__setattr__(
+            self, 'episode_batch_size',
+            _positive_integer(self.episode_batch_size, 'episode_batch_size'))
+        object.__setattr__(self, 'task_schedule',
+                           _normalize_task_ids(self.task_schedule))
+        if self.episode_batch_size > 1:
+            if self.strict_worker_assignment:
+                raise ValueError('Native batches require dynamic scheduling')
+        for name in ('nonfinite_batch_retry_limit',
+                     'nonfinite_batch_retry_budget'):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f'{name} must be a nonnegative integer')
+        if self.nonfinite_batch_retry_limit and self.episode_batch_size <= 1:
+            raise ValueError('Nonfinite batch retries require native batches')
+        offsets = self.task_seed_offsets
+        if not isinstance(offsets, Mapping) or any(
+                not isinstance(k, str) or not k or type(v) is not int or v < 0
+                for k, v in offsets.items()):
+            raise ValueError(
+                'task_seed_offsets must map task IDs to nonnegative integers')
+        object.__setattr__(self, 'task_seed_offsets', dict(offsets))
+        if offsets and self.resume_path:
+            raise ValueError('Seed-mapped shards require a fresh evaluation')
         run_name = self.run_name or _default_run_name()
         _validate_run_name(run_name)
         object.__setattr__(self, 'run_name', run_name)
@@ -201,6 +233,11 @@ class EvaluationRun:
         payload['parallel_workers'] = worker_count
         payload['strict_worker_assignment'] = (
             self.settings.strict_worker_assignment)
+        payload['episode_batch_size'] = self.settings.episode_batch_size
+        payload['task_schedule'] = self.settings.task_schedule
+        if self.settings.task_seed_offsets:
+            payload['task_seed_offsets'] = dict(
+                self.settings.task_seed_offsets)
         if self.resume_data:
             # Config checks alone cannot detect a changed task inventory;
             # compare the tasks actually discovered by the simulator as well.
@@ -209,6 +246,9 @@ class EvaluationRun:
                                  'from the original run')
             payload['resumed_from'] = self.resume_data['source']
             payload['restored_episodes'] = len(self.resume_data['completed'])
+            # Persist before publishing a resumable run_start. A failed write
+            # must not leave a journal claiming an unavailable recovery input.
+            self.reporter.persist_resume_input(self.resume_data)
         self.start_payload = payload
         self._state.status = EvaluationStatus.RUNNING
         self.evaluator.on_run_start(self._state.selected_tasks)
@@ -335,6 +375,8 @@ def _validate_resume_settings(settings: EvaluationSettings,
     fields = ('base_seed', 'episodes_per_task', 'max_episode_steps',
               'execute_horizon', 'stop_on_success', 'strict_worker_assignment')
     changed = any(getattr(settings, key) != start.get(key) for key in fields)
+    changed |= settings.episode_batch_size != start.get(
+        'episode_batch_size', 1)
     counts = {
         task:
         settings.episodes_per_task_overrides.get(task,
