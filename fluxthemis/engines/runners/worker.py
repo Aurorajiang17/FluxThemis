@@ -32,14 +32,16 @@ _SIMULATOR_STARTUP_TIMEOUT_S = 180.0
 class SimulatorWorkerSupervisor:
     """Restart one disposable simulator worker process when it exits."""
 
-    def __init__(self,
-                 config_path: str,
-                 rollout_endpoint: str,
-                 worker_id: str,
-                 deployment_id: str,
-                 device: str,
-                 episode_timeout_s: float,
-                 config_overrides: Mapping[str, Any] | None = None) -> None:
+    def __init__(
+            self,
+            config_path: str,
+            rollout_endpoint: str,
+            worker_id: str,
+            deployment_id: str,
+            device: str,
+            episode_timeout_s: float,
+            config_overrides: Mapping[str, Any] | None = None,
+            startup_timeout_s: float = _SIMULATOR_STARTUP_TIMEOUT_S) -> None:
         self.config_path = config_path
         self.rollout_endpoint = _endpoint(rollout_endpoint, 'rollout_endpoint')
         self.worker_id = _nonempty(worker_id, 'worker_id')
@@ -47,6 +49,8 @@ class SimulatorWorkerSupervisor:
         self.device = _nonempty(device, 'device')
         self.episode_timeout_s = _positive_float(episode_timeout_s,
                                                  'episode_timeout_s')
+        self.startup_timeout_s = _positive_float(startup_timeout_s,
+                                                 'startup_timeout_s')
         self.config_overrides = dict(config_overrides or {})
         self._context = multiprocessing.get_context('spawn')
 
@@ -80,7 +84,7 @@ class SimulatorWorkerSupervisor:
             process.start()
             startup_timed_out = False
             try:
-                deadline = time.monotonic() + _SIMULATOR_STARTUP_TIMEOUT_S
+                deadline = time.monotonic() + self.startup_timeout_s
                 while process.is_alive() and not ready_event.is_set():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -89,7 +93,7 @@ class SimulatorWorkerSupervisor:
                 if process.is_alive() and not ready_event.is_set():
                     print(
                         f'[FluxThemis] {self.worker_id} did not become ready '
-                        f'within {_SIMULATOR_STARTUP_TIMEOUT_S:g}s; '
+                        f'within {self.startup_timeout_s:g}s; '
                         'terminating',
                         flush=True,
                     )

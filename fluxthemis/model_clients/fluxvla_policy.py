@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 import uuid
+from bisect import bisect_right
+from collections import OrderedDict
 from collections.abc import Mapping
 from numbers import Integral
 from typing import Any
@@ -28,11 +30,33 @@ _POLICY_TRANSPORT_FIELDS = CONNECTION_TRANSPORT_FIELDS | frozenset({
 })
 
 
+def _select_history_steps(available, current_step, num_frames, stride):
+    """Anchor, then the closest earlier observation at each requested step."""
+    steps = sorted(set(available) | {0})
+    requested = [
+        current_step - stride * j for j in reversed(range(num_frames))
+    ]
+    return [0] + [
+        steps[max(0,
+                  bisect_right(steps, max(0, t)) - 1)] for t in requested
+    ]
+
+
 @POLICY_CLIENTS.register_module()
 class FluxVLAPolicyClient(BasePolicyClient):
-    """Synchronous policy client backed by the FluxVLA model service."""
+    """Synchronous policy client backed by the FluxVLA model service.
 
-    def __init__(self, transport: Mapping[str, Any]) -> None:
+    ``history=None`` sends only the current observation. A history mapping
+    enables an episode anchor and ``num_frames`` images spaced ``stride``
+    simulator steps apart. With history enabled, ``replan_steps`` must match
+    the number of actions executed between predictions.
+    """
+
+    def __init__(self,
+                 transport: Mapping[str, Any],
+                 *,
+                 history: Mapping[str, Any] | None = None,
+                 replan_steps: int = 24) -> None:
         if not isinstance(transport, Mapping):
             raise TypeError('transport must be a mapping')
         values = dict(transport)
@@ -63,6 +87,29 @@ class FluxVLAPolicyClient(BasePolicyClient):
         self._policy_seed: int | None = None
         self._prediction_sequence = 0
         self.last_profile: dict[str, float] = {}
+        self._history_enabled = history is not None
+        if self._history_enabled:
+            if not isinstance(history, Mapping):
+                raise TypeError('history must be a mapping or None')
+            history = dict(history)
+            self.num_history_frames = int(history.pop('num_frames', 8))
+            self.history_stride = int(history.pop('stride', 25))
+            include_anchor = history.pop('include_anchor', True)
+            if history or not include_anchor:
+                raise ValueError(
+                    'History requires an anchor and num_frames/stride only')
+            self.replan_steps = int(replan_steps)
+            if min(self.num_history_frames, self.history_stride,
+                   self.replan_steps) <= 0:
+                raise ValueError(
+                    'History and replan dimensions must be positive')
+        self._clear_history()
+
+    def _clear_history(self) -> None:
+        self._frames = OrderedDict()
+        self._anchor = None
+        self._step = 0
+        self._replan_index = 0
 
     def setup(self) -> None:
         self.transport.setup()
@@ -84,6 +131,28 @@ class FluxVLAPolicyClient(BasePolicyClient):
         self._episode_id = f'{task.task_id}:{int(episode_index)}'
         self._policy_seed = int(policy_seed)
         self._prediction_sequence = 0
+        self._clear_history()
+
+    def _snapshot(self, observation: Mapping[str,
+                                             Any]) -> dict[str, np.ndarray]:
+        return {
+            key: self._validate_image(observation[key], key).copy()
+            for key in self.image_keys
+        }
+
+    def observe(self, observation: Any) -> None:
+        if not self._history_enabled:
+            return
+        if self._anchor is None:
+            raise RuntimeError(
+                'The reset observation must be predicted before observe()')
+        frame = self._snapshot(observation)
+        self._step += 1
+        self._frames[self._step] = frame
+        cutoff = self._step - (self.num_history_frames -
+                               1) * self.history_stride
+        while self._frames and next(iter(self._frames)) < cutoff:
+            self._frames.popitem(last=False)
 
     def set_episode_id(self, episode_id: str) -> None:
         episode_id = nonempty_string(episode_id, 'episode_id')
@@ -100,6 +169,14 @@ class FluxVLAPolicyClient(BasePolicyClient):
         if not isinstance(context, Mapping):
             raise TypeError('FluxVLA ZMQ context must be a mapping')
         self._ensure_ready()
+        if self._history_enabled:
+            if self._step != self.replan_steps * self._replan_index:
+                raise RuntimeError(
+                    f'History alignment mismatch: step={self._step}, '
+                    f'replan={self._replan_index}, horizon={self.replan_steps}'
+                )
+            if self._anchor is None:
+                self._anchor = self._snapshot(observation)
 
         started = time.perf_counter()
         request_id = uuid.uuid4().hex
@@ -116,7 +193,7 @@ class FluxVLAPolicyClient(BasePolicyClient):
             'server_infer_s': server_infer_s,
             'network_and_queue_s': max(roundtrip_s - server_infer_s, 0.0),
         }
-        return ActionChunk(
+        result = ActionChunk(
             actions=actions,
             metadata={
                 'profile': dict(self.last_profile),
@@ -127,14 +204,20 @@ class FluxVLAPolicyClient(BasePolicyClient):
                 'denormalized': True,
             },
         )
+        if self._history_enabled:
+            self._replan_index += 1
+        return result
 
     def close(self) -> None:
-        self.transport.close()
-        self._task = None
-        self._episode_index = None
-        self._episode_id = None
-        self._policy_seed = None
-        self._prediction_sequence = 0
+        try:
+            self.transport.close()
+            self._task = None
+            self._episode_index = None
+            self._episode_id = None
+            self._policy_seed = None
+            self._prediction_sequence = 0
+        finally:
+            self._clear_history()
 
     def _ensure_ready(self) -> None:
         if any(
@@ -162,6 +245,17 @@ class FluxVLAPolicyClient(BasePolicyClient):
         payload = dict(images)
         payload.update(state)
         payload['task_description'] = prompt
+        if self._history_enabled:
+            steps = _select_history_steps(self._frames, self._step,
+                                          self.num_history_frames,
+                                          self.history_stride)
+            for key in self.image_keys:
+                payload[key + '_history'] = np.stack([
+                    (self._anchor if step == 0 else self._frames[step])[key]
+                    for step in steps
+                ])
+            payload['history_steps'] = np.asarray(steps, dtype=np.int64)
+            payload['replan_index'] = self._replan_index
         header = encode_header(
             'predict_action',
             deployment_id=self.transport.server_deployment_id,

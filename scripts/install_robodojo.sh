@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-ROBODOJO_REF="${ROBODOJO_REF:-2184bf8844ea9d205382c4aefa3a694311418251}"
+ROBODOJO_REF="${ROBODOJO_REF:-6e3190f151fb7e1201798c9c40faa1272e503055}"
 FLUXTHEMIS_ROOT="${FLUXTHEMIS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ROBODOJO_ROOT="${ROBODOJO_ROOT:-$(dirname "${FLUXTHEMIS_ROOT}")/RoboDojo}"
 SKIP_ASSETS=0
@@ -53,6 +53,7 @@ elif [[ ! -d "${ROBODOJO_ROOT}/.git" ]]; then
 fi
 
 git -C "${ROBODOJO_ROOT}" checkout "${ROBODOJO_REF}"
+python "${FLUXTHEMIS_ROOT}/scripts/preflight/robodojo.py" --root "${ROBODOJO_ROOT}"
 [[ -f "${ROBODOJO_ROOT}/scripts/install.sh" ]] || \
   { echo "error: missing RoboDojo install.sh" >&2; exit 1; }
 

@@ -21,6 +21,9 @@ class BasePolicyClient(ABC):
               policy_seed: int) -> None:
         """Reset episode-local model state."""
 
+    def observe(self, observation: Any) -> None:
+        """Record post-step observations, including within action chunks."""
+
     @abstractmethod
     def set_episode_id(self, episode_id: str) -> None:
         """Set the exact id used by subsequent episode inference requests."""

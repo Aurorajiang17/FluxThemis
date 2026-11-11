@@ -245,6 +245,8 @@ def _resolve_task_names(task_name: str | Sequence[str],
 @dataclass(frozen=True)
 class _PrelaunchRuntime:
     AppLauncher: Any
+    add_zero_delay_kit_args: Any
+    zero_delay_active: Any
     OmegaConf: Any
     get_physx_monitor: Any
     ROOT_DIR: str
@@ -302,6 +304,8 @@ def _launch_worker_app(launcher: Any, args: argparse.Namespace) -> Any:
 def _load_prelaunch_runtime() -> _PrelaunchRuntime:
     """Import the modules that are safe before the Isaac Sim app launches."""
     try:
+        from env.camera_manager.capture.render_sync import (
+            add_zero_delay_kit_args, zero_delay_active)
         from env.global_configs import BENCHMARK, ENV_CONFIG_PATH, ROOT_DIR
         from isaaclab.app import AppLauncher
         from omegaconf import OmegaConf
@@ -311,9 +315,13 @@ def _load_prelaunch_runtime() -> _PrelaunchRuntime:
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             'RoboDojoEnvironment requires the RoboDojo simulation stack. '
-            'Install it with `bash scripts/install_robodojo.sh`.') from exc
+            'Install it with `bash scripts/install_robodojo.sh`; for restored '
+            'sources run `python scripts/preflight/robodojo.py --root '
+            '"$ROBODOJO_ROOT"`.') from exc
     return _PrelaunchRuntime(
         AppLauncher=AppLauncher,
+        add_zero_delay_kit_args=add_zero_delay_kit_args,
+        zero_delay_active=zero_delay_active,
         OmegaConf=OmegaConf,
         get_physx_monitor=get_monitor,
         ROOT_DIR=ROOT_DIR,
@@ -466,9 +474,15 @@ class RoboDojoEnvironment(BaseEnvironment):
         simulation_app = None
         try:
             physx_monitor.start(enabled=True)
-            app_launcher = _launch_worker_app(
-                runtime.AppLauncher, self._build_app_args(runtime.AppLauncher))
+            app_args = self._build_app_args(runtime.AppLauncher)
+            # Themis bypasses RoboDojo's main.py. These settings must be
+            # supplied before Kit reads its update order during startup.
+            runtime.add_zero_delay_kit_args(app_args)
+            app_launcher = _launch_worker_app(runtime.AppLauncher, app_args)
             simulation_app = app_launcher.app
+            if not runtime.zero_delay_active():
+                raise RuntimeError('RoboDojo zero-delay camera settings did '
+                                   'not take effect during Kit startup')
             self._runtime = runtime
             self._simulation_app = simulation_app
             # Isaac Sim / Kit may prepend its own entries to sys.path after
@@ -905,10 +919,19 @@ class RoboDojoEnvironment(BaseEnvironment):
             args = argparse.Namespace()
         args.headless = self.headless
         args.enable_cameras = True
+        # A Themis worker owns one device. Kit otherwise defaults to rendering
+        # across visible GPUs, unlike IsaacLab's own distributed launch path.
+        args.multi_gpu = False
         args.video = False
         args.num_envs = self.num_envs
         args.device = f'cuda:{self._device_id}'
         args.seed = self.seed
+        # AppLauncher derives active_gpu from the CUDA ordinal. Vulkan does
+        # not renumber GPUs with CUDA_VISIBLE_DEVICES, so override the Kit
+        # rendering device after AppLauncher's generated command arguments.
+        args.kit_args = (
+            getattr(args, 'kit_args', '') +
+            f' --/renderer/activeGpu={self._render_device_id}').strip()
         # XDG_CACHE_HOME alone does not move Kit's portable directories out
         # of a shared Conda install. Each disposable worker gets its own
         # data/cache/logs root, including after a supervisor restart.
@@ -1000,6 +1023,21 @@ class RoboDojoEnvironment(BaseEnvironment):
         runtime.OmegaConf.update(
             env_cfg, 'sim.seed', [0] * self.num_envs, force_add=True)
         return env_cfg
+
+    @property
+    def _render_device_id(self) -> int:
+        configured = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        if configured and configured != '-1':
+            try:
+                devices = tuple(
+                    int(value.strip()) for value in configured.split(',')
+                    if value.strip())
+            except ValueError as exc:
+                raise ValueError('RoboDojo rendering requires numeric '
+                                 'CUDA_VISIBLE_DEVICES identifiers') from exc
+            if devices:
+                return devices[self._device_id]
+        return self._device_id
 
     @property
     def _device_id(self) -> int:

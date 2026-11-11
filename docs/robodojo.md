@@ -1,479 +1,190 @@
 # RoboDojo Integration
 
-RoboDojo and Isaac Sim run only in FluxThemis simulator workers. Themis selects
-layouts, schedules episodes and advances the simulation; FluxVLA model workers
-receive observations over ZMQ and return denormalized joint actions. Assets and
-Eval_Layout belong on the simulator side; weights, tokenizer and normalization
-statistics belong on the model side. Model and simulator worker counts are independent.
+FluxThemis runs RoboDojo simulation, schedules episodes and sends observations
+through ZMQ to a separately started FluxVLA model service. Keep simulator assets
+on the Sim host and model weights, tokenizer and statistics on the Predict host.
 
-- [Environment and model preparation](#environment-and-model-preparation)
-- [Evaluation data and quotas](#evaluation-data-and-quotas)
-- [Launch and network](#launch-and-network)
-- [Progress, results and resume](#progress-results-and-resume)
-- [Compatibility and troubleshooting](#compatibility-and-troubleshooting)
-- [Full task list](#full-task-list)
+## Installation
 
-## Environment and Model Preparation
-
-Cloud model and simulator tasks each use the Python environment from their own
-image. Simulation requires an RTX/RT-capable GPU; A100/A800 can run the model.
-Code on shared storage can be installed into a task-private directory, while
-runtime dependencies use that task's own environment.
-
-### Install
+Simulation requires an RTX/RT-capable GPU and RoboDojo's Isaac Sim environment.
+From the FluxThemis checkout:
 
 ```bash
-cd /root/projects/FluxThemis
+export ROBODOJO_ROOT=/path/to/RoboDojo
 bash scripts/install_robodojo.sh
+conda activate RoboDojo
 ```
 
-The installer uses RoboDojo's official environment and asset scripts, then
-installs FluxThemis with its ZMQ dependencies into the `RoboDojo` environment.
+The [installer](../scripts/install_robodojo.sh) selects the RoboDojo source,
+installs its environment and assets, and adds FluxThemis. Use `--skip-assets`
+when assets are already available. It includes upstream camera synchronization
+and applies the [reference PhysX reset fix](https://github.com/roboterax/video-prediction-policy-2/blob/3365872910244f14df83003062f7c563f14c6d9e/patches/robodojo_spring_button_reset.patch).
 
-### Required Configuration
+For an existing or restored environment, use a source tree with those camera
+interfaces and prepare it before starting simulator workers:
 
-- Simulator-only deployments can use `configs/robodojo/arx_x5.py` in FluxThemis. It contains
-  only simulator, evaluation and observation/action interface settings; no
-  local FluxVLA model checkout is required. The default benchmark matches
-  FluxVLA's RoboDojo FT evaluation: 54 task variants, 2,100 episodes, seed 0,
-  at most 2,000 steps per episode and 50 actions per prediction. Existing
-  deployments can still pass their FluxVLA RoboDojo configuration to
-  `distributed_eval.sh`; the separate simulator config is optional.
-- The simulator needs the RoboDojo revision selected by
-  `scripts/install_robodojo.sh`, its Isaac Sim/IsaacLab dependencies, and the
-  official [Assets](https://huggingface.co/datasets/RoboDojo-Benchmark/RoboDojo/tree/main/Assets).
-  Set `ROBODOJO_ROOT` (or `themis.evaluation.environment.robodojo_root`) to the simulator checkout;
-  place Assets under that root and regenerate robot paths with
-  `utils/update_embodiment_config_path.py` after relocating them. Training
-  demonstrations are not needed for evaluation.
-- For pi0.5, use the matching
-  [RoboDojo FT checkpoint, tokenizer and statistics](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_paligemma_robodojo_full_finetune_bs256)
-  with `pi05_paligemma_robodojo_full_finetune.py`. This configuration uses three
-  cameras and 14D ARX-X5 joint actions. Set `--ckpt-path`,
-  `themis.server.norm_stats_path`, and the `ProcessPrompts` tokenizer path in
-  `eval.dataset.transforms` to the downloaded files. When loading a complete
-  FT checkpoint without the base checkpoint, set both
-  `model.pretrained_name_or_path=None` and
-  `inference_model.pretrained_name_or_path=None` via `--cfg-options`.
-- Both environments require `pyzmq` and `msgpack`. The simulator connects to
-  the model service's frontend using `--server-endpoint tcp://MODEL_HOST:15555`.
-  `MODEL_HOST` must be reachable from the simulator process/container through
-  the private network or an existing tunnel. For a same-host tunnel use
-  `127.0.0.1`; the endpoint option does not establish a tunnel.
-- The Themis launchers let each side select its own `--gpu-ids` and
-  `--workers-per-gpu` (default 1).
-  Use `--scheduling dynamic` on both sides to allow different worker counts.
-  When model inference shares a memory-limited GPU with Isaac Sim, the model
-  option `--cfg-options themis.server.runner.autocast_cache_enabled=False`
-  saves cast-weight cache memory while retaining FP32 parameters and the
-  configured autocast dtype; repeated casts can reduce throughput.
+```bash
+python scripts/preflight/robodojo.py --root "$ROBODOJO_ROOT"
+python scripts/preflight/robodojo.py --root "$ROBODOJO_ROOT" --check
+```
 
-## Evaluation Data and Quotas
+Preparation accepts an already applied fix and archives without `.git`.
+Actual evaluation startup also checks the environment and required assets.
 
-### Assets and Storage
+## Assets and Evaluation Quotas
 
-Source: [RoboDojo-Benchmark/RoboDojo](https://huggingface.co/datasets/RoboDojo-Benchmark/RoboDojo).
-The following totals were recorded on 2026-10-16 from Hugging Face file metadata
-at revision
-[`35efbc7dedfdbeeb6e95fb749bd885d73d483e41`](https://huggingface.co/datasets/RoboDojo-Benchmark/RoboDojo/tree/35efbc7dedfdbeeb6e95fb749bd885d73d483e41).
-They sum logical file sizes, excluding download caches, container images, runtime
-caches, evaluation videos and results. Later revisions may differ.
-
-| Directory | Files | Exact bytes | Decimal size | Use |
-| --- | ---: | ---: | ---: | --- |
-| `Assets/` | 15,365 | 41,269,513,111 | 41.27 GB | Simulator scenes, objects, materials, robots and evaluation layouts |
-| `data/` | 53,710 | 6,487,684,022,944 | 6.49 TB | Training demonstrations; not needed for online evaluation |
-| `ckpt/` | 2,403 | 1,082,114,830,735 | 1.08 TB | Model collection; download only the model being evaluated |
-
-`--include 'Assets/**'` selects **41.27 GB = 38.44 GiB**, where GB = 10^9 bytes
-and GiB = 2^30 bytes. Allow additional space for temporary files, Xet/Isaac caches
-and videos. Download only the assets with:
+Closed-loop evaluation needs `Assets/`, including `Eval_Layout`, approximately
+**41 GB** at the snapshot below. Training demonstrations and unrelated model
+checkpoints are unnecessary. To download assets separately:
 
 ```bash
 hf download RoboDojo-Benchmark/RoboDojo \
   --repo-type dataset \
   --revision 35efbc7dedfdbeeb6e95fb749bd885d73d483e41 \
   --include 'Assets/**' \
-  --local-dir /path/to/assets-full
+  --local-dir "$ROBODOJO_ROOT"
 ```
 
-The resulting asset root is `/path/to/assets-full/Assets`. Set download proxy
-and concurrency options for the deployment environment.
-
-### Episode Quotas
-
-The [Themis config](../configs/robodojo/arx_x5.py) and
-[task groups](../fluxthemis/environments/sim/robodojo.py) match the evaluation
-settings in FluxVLA's `configs/pi05/pi05_paligemma_robodojo_full_finetune.py`.
-There are **42 base tasks**, including 12 generalization tasks with an additional
-`_random` variant each: **54 executable task variants and 2,100 episodes**.
-An episode is one complete attempt starting from a selected layout. These are
-evaluation quotas, not training demonstration or asset counts.
-
-| Category | Base tasks | Tasks including variants | Episodes per task | Total episodes |
-| --- | ---: | ---: | ---: | ---: |
-| Generalization | 12 | 24 | 25 | 600 |
-| Memory | 6 | 6 | 50 | 300 |
-| Precision | 8 | 8 | 50 | 400 |
-| Long-horizon | 8 | 8 | 50 | 400 |
-| Open | 8 | 8 | 50 | 400 |
-| **Total** | **42** | **54** | — | **2,100** |
-
-Defaults are `base_seed=0`, at most 2,000 action steps per episode and up to 50
-executed actions before requesting another prediction. The base seed starts a
-seed sequence; it does not make every episode's policy seed zero. Layout indexes
-advance separately for each task. Rejected unstable layouts can require more
-available layouts than the accepted episode quota.
-
-These quotas apply to `task_name=all` or the YAML launcher's `--full` option,
-regardless of worker count. Subset runs follow their resolved configuration and
-runtime task manifest. See [YAML launch](#yaml-launch) for smoke settings and the
-[full task list](#full-task-list) for individual IDs and quotas.
-
-## Launch and Network
-
-Start the model independently, then start the simulator using either the native
-commands below or the [YAML launcher](#yaml-launch). The model endpoint is
-independent of the simulator task's `MASTER_ADDR`; use an address reachable from
-the simulator as described under [Network](#network).
-
-### Five-Episode Smoke Test
-
-Start FluxVLA using its existing server entry point:
+After moving the source or assets, regenerate robot paths:
 
 ```bash
-conda activate fluxvla
-cd /root/projects/FluxVLA
-CUDA_VISIBLE_DEVICES=0 \
-bash scripts/distributed_zmq_server.sh \
-  --config configs/pi05/pi05_paligemma_robodojo_full_finetune.py \
-  --ckpt-path /path/to/model.safetensors
+(cd "$ROBODOJO_ROOT" && python utils/update_embodiment_config_path.py)
 ```
 
-Keep existing model config and checkpoint paths when they are already prepared.
-A separate config copy is optional; asset paths must resolve in the model environment.
+The [default config](../configs/robodojo/arx_x5.py) covers **42 base tasks,
+54 executable variants and 2,100 episodes** per full run. Each generalization
+task and its `_random` variant gets 25 episodes; other tasks get 50.
+See the config for quotas and the [environment task groups](../fluxthemis/environments/sim/robodojo.py)
+for case-sensitive task IDs. Unstable layouts are replaced with spare layouts,
+so available layouts may need to exceed the accepted episode quota.
 
-For Themis's optional GPU/worker and scheduling wrapper, see the
-[launcher guide](../guides/evaluation.md#两端独立启动). It delegates model loading
-and serving to FluxVLA's `distributed_zmq_server.py` and uses the same model
-configs and checkpoints. The wrapper requires that entry point to support
-`--workers-per-gpu` and replica-to-device mapping; older FluxVLA checkouts can
-continue using the native command above.
+The default config uses three cameras, 14D joint actions, `base_seed=0`, at most
+2,000 action steps per episode and up to 50 actions per prediction. Policy seeds
+and task-local layout indexes are separate. VPP2 uses the
+[EE16/history config](../configs/robodojo/vpp2.py), which inherits these tasks and
+quotas and overrides the action interface and replanning settings.
 
-Start FluxThemis:
+<a id="five-episode-smoke-test"></a>
+
+## Launch
+
+Start the model service using the [README commands](../README.md#zmq-evaluation-launcher)
+or the [launcher guide](../guides/evaluation.md). Use matching model config,
+checkpoint, tokenizer and normalization statistics. The default simulator config
+matches FluxVLA's `pi05_paligemma_robodojo_full_finetune.py`; its released bundle
+is [available here](https://huggingface.co/limxdynamics/FluxVLAEngine/tree/main/pi05_paligemma_robodojo_full_finetune_bs256).
+
+### Smoke and Full Evaluation
+
+In the prepared simulator environment, run from the FluxThemis checkout:
 
 ```bash
-conda activate RoboDojo
-cd /root/projects/FluxThemis
-CUDA_VISIBLE_DEVICES=1,2,3,4,5 \
-bash scripts/distributed_eval.sh \
+bash scripts/run_evaluation.sh \
   --config configs/robodojo/arx_x5.py \
-  --server-endpoint "tcp://${MODEL_HOST:-127.0.0.1}:15555" \
-  --workers-per-gpu 1 --scheduling dynamic \
-  --run-name put-bottles-5ep \
-  --save-videos \
-  --video-dir /persistent/eval/put-bottles-5ep \
-  --cfg-options \
-    themis.evaluation.environment.task_name=put_bottles_into_dustbin \
-    themis.evaluation.episodes_per_task=5
+  --server-endpoint tcp://MODEL_HOST:15555 \
+  --gpu-ids 0 --workers-per-gpu 1 --smoke --save-videos \
+  --output ./work_dirs/robodojo
 ```
 
-### Full Benchmark
+`--smoke` runs `put_bottles_into_dustbin`, one episode per simulator worker.
+Replace it with `--full` to use all tasks and their configured quotas. Start a
+fresh model service between runs: FluxVLA exits after an accepted `run_end`.
+Add `--dry-run` to inspect the resolved config without starting workloads;
+installed dependencies, assets and connectivity are checked during a real run.
 
-The checked-in RoboDojo configs contain official per-task episode overrides.
-Run without task or episode overrides:
+Use the model address reachable from the simulator. For a same-host service or
+an existing local SSH forward, use `tcp://127.0.0.1:15555`; this is the ZMQ port,
+not the SSH login port. Choose separate GPU IDs when both roles share a host.
+Dynamic scheduling allows different Sim and Predict worker counts; fixed
+scheduling requires equal counts. See [network and scheduling details](../guides/evaluation.md).
+
+This launcher supports one simulator host with multiple GPUs. For multiple
+simulator nodes, use `distributed_eval.sh` as described in the
+[README](../README.md#multi-node-evaluation).
+
+### VPP2
+
+Start the model service following the
+[FluxVLA guide](https://github.com/FluxVLA/FluxVLA/blob/main/docs/vpp2.md), then run:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1,2,3,4,5 \
-bash scripts/distributed_eval.sh \
-  --config configs/robodojo/arx_x5.py \
-  --server-endpoint "tcp://${MODEL_HOST:-127.0.0.1}:15555" \
-  --workers-per-gpu 1 --scheduling dynamic \
-  --run-name pi05-full
+ROBODOJO_EVAL_SEED=0 bash scripts/run_evaluation.sh \
+  --config configs/robodojo/vpp2.py \
+  --server-endpoint tcp://MODEL_HOST:15555 \
+  --gpu-ids 0 --workers-per-gpu 1 --full --save-videos \
+  --output ./work_dirs/vpp2/seed0
 ```
 
-FluxVLA writes the official progress-score and success-rate overview at
-`run_end`. FluxThemis keeps policy seeds fixed while assigning task-local
-environment case indexes. For RoboDojo, a case index selects one layout. An
-unstable layout is rejected before `episode_start`; the coordinator retries
-that episode slot with the next case without counting the rejected attempt.
-RoboDojo's PhysX monitor terminates a disposable Simulator process after a
-fatal CUDA/PhysX failure. The local Supervisor starts a fresh worker, which
-reconnects directly to the coordinator under the same logical identity. The
-coordinator retries the exact episode without stopping other simulators. Use
-`--simulator-restart-limit` to bound retries for one episode or failed startup
-sequence.
+Repeat with environment seeds 1 and 2, separate output directories and a fresh
+model service for each run. Without `ROBODOJO_EVAL_SEED`, the default is 1.
+The config uses absolute EE16 actions, an episode anchor and eight camera frames
+spaced 25 steps apart, executing 24 actions before replanning. No FluxVLA config
+or Python installation is needed on the simulator host.
 
-For multiple simulator nodes, use the same shell launcher with the node
-environment variables documented in the repository README.
+For the two-task baseline, omit `--full` and add
+`--cfg-options themis.evaluation.environment.task_name=insert_tubes,put_bottles_into_dustbin`.
+Each task runs 50 episodes. Progress, results and resume use the common flow below.
 
 ### YAML Launch
 
-The same `run_evaluation` entry handles LIBERO and RoboDojo, using a launch YAML
-or a Themis Python config. It starts only simulator processes and connects to the
-configured model service; it never starts or replaces the model.
-
-Task submission, dependency installation and SSH tunnels are managed by external
-deployment tools. After moving RoboDojo or Assets, regenerate robot path configs
-in a task-private asset view. The launcher checks these paths and records the
-environment identity for resume.
-
-From FluxThemis in the prepared simulator environment:
+To save paths, endpoint and worker counts, edit the commented
+[launch template](../configs/robodojo/remote.yaml):
 
 ```bash
-python scripts/run_evaluation.py --config configs/robodojo/remote.yaml --smoke --dry-run
-python scripts/run_evaluation.py --config configs/robodojo/remote.yaml --smoke
-python scripts/run_evaluation.py --config configs/robodojo/remote.yaml --full
+bash scripts/run_evaluation.sh --config configs/robodojo/remote.yaml --smoke
 ```
 
-`--smoke` selects `put_bottles_into_dustbin` with one episode per simulator
-process; `--full` selects `all` with the Python config's per-task quotas. The
-options are mutually exclusive and preserve YAML GPU/worker counts, paths and
-connection settings. Without either option, YAML `task`/`episodes` apply. The
-supplied template defaults to one GPU, one simulator and one episode; it is also
-used when `--config` is omitted.
+Paths are relative to the YAML file and support `~` and `${ENV_VAR}`.
+`--smoke` and `--full` override task selection and quotas; without either flag,
+`simulator.task` and `simulator.episodes` apply. For other options, use
+`bash scripts/run_evaluation.sh --help` and the [launcher guide](../guides/evaluation.md).
 
-This launcher manages one simulator host with multiple GPUs/workers. For multiple
-nodes use `scripts/distributed_eval.sh`. Set GPU/worker counts for the actual
-resources; defaults are not capacity recommendations.
+## Results and Resume
 
-| YAML field | Meaning |
-| --- | --- |
-| `simulator.python` | Simulator Python; defaults to the current interpreter |
-| `simulator.robodojo_root` / `assets` | Prepared source and assets; Assets defaults to the source root's Assets directory |
-| `simulator.config` | Themis evaluation config; the template uses `arx_x5.py`, with no local VLA checkout required |
-| `simulator.gpu_ids` / `workers_per_gpu` | Local GPUs and simulators per GPU; independent of model replica counts |
-| `simulator.task` / `episodes` | Tasks and quotas when neither `--smoke` nor `--full` is supplied |
-| `simulator.cache` | Optional simulator runtime cache directory |
-| `simulator.save_videos` | Save simulator videos; enabled in the RoboDojo template |
-| `simulator.scheduling` | Optional dynamic/fixed override; default follows the evaluation config |
-| `simulator.coordinator_port` | Simulator coordinator port; the next port is reserved for torchrun |
-| `model.host` / `port` | Model frontend reachable from simulator processes |
-| `model.expected_workers` | Optional model replica count check |
-| `model.result_dir` | Optional model input directory: `model_identity.json` for resume; `model_metrics.jsonl` for GPU telemetry |
-| `model.wait_seconds` | Time budget for model and simulator startup |
-| `run.output_root` / `max_minutes` | Persistent output root and runtime limit; 0 means unlimited |
-| `resume.from_dir` | Stopped previous run directory; empty starts a new evaluation |
+The launcher prints `Results: ...` for a new directory under `--output` or YAML
+`run.output_root`. Keep it on persistent storage. Useful files are:
 
-Paths are relative to the YAML file and support `~` and `${ENV_VAR}`. Scheduling
-follows the Python evaluation config or an explicit YAML/CLI override;
-keep the model in the same mode. Dynamic allows different model/simulator counts;
-fixed requires equal counts. See the [launcher guide](../guides/evaluation.md).
+- `progress.json/log`: completed episode count and ETA, including failures.
+- `simulator.log` and `events.jsonl`: diagnostics and acknowledged episode events.
+- `result.json`: completeness, success count and the model's result location.
+- `performance_report.json/txt`: resource and throughput measurements.
 
-### Network
-
-On the same host, use `127.0.0.1:15555`. On a reachable private network, use the
-model host's private IP and port 15555. Across clusters, first establish an SSH
-tunnel on the **simulator host**:
-
-```bash
-ssh -N -T -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
-  -p SSH_PORT -i /path/to/client_key \
-  -L 127.0.0.1:15555:127.0.0.1:15555 USER@MODEL_SSH_HOST
-```
-
-Then set YAML `model.host: 127.0.0.1` and `model.port: 15555`. The public SSH port
-is the login endpoint; 15555 is the ZMQ model port. The connecting host holds the
-private key and authorizes its public key on the model host. An external task
-script can maintain the tunnel. The launcher queries model status, shows ready
-replica counts and starts simulation when the service is ready.
-
-For local Docker, start the container separately, mount code, Assets and outputs,
-and run the same Python launcher inside it. The model address must be reachable
-from that container's network namespace.
-
-`--dry-run` resolves settings and writes a plan/config snapshot without querying
-resources, checking installed simulator packages, hashing assets or connecting.
-Those environment checks run on actual startup.
-
-## Progress, Results and Resume
-
-The YAML launcher displays startup stages, then one updating line with an
-episode progress bar, completed/total count and ETA. Redirected logs record
-progress once per minute, plus status changes and completion. ETA uses the
-current run's observed execution speed; task duration differences, restarts
-and scene changes can affect it. Resource measurements and throughput remain
-in the report files.
-
-Each run creates a separate output directory with the plan and config snapshots,
-`progress.log/json`, `simulator.log`, acknowledged `events.jsonl`, `result.json`,
-videos, raw resource samples and `performance_report.json/txt`. The model side
-saves the official benchmark summary. The launcher prints both output locations;
-external controllers can use `--result-pointer FILE` to obtain the current run's
-output directory.
-
-Reports distinguish whole-GPU baseline/peak increments, simulator process-tree
-CPU/PSS and the actual episode execution window. Summed RSS double-counts shared
-pages; whole-GPU/host increments can include other processes. Missing samples
-remain unavailable. Inference wait includes model service time;
-`network_and_queue_s` includes network, serialization and queuing time.
-`model.result_dir` can be shared storage or externally collected SSH telemetry.
-Without it, reports do not infer model GPU bottlenecks. Telemetry needs synchronized
-clocks; SSH-forwarded samples prefer reception timestamps.
+The model service writes the authoritative benchmark summary. Raw pooled success
+counts need not equal a benchmark's official aggregation. See
+[artifact details](../README.md#artifacts) for output paths and video recording.
 
 ### Resume
 
-Stop the old run before setting `resume.from_dir` in YAML or passing
-`--resume /path/to/old-run`. Keep the original `--smoke`/`--full` option or set the
-same task and episode quotas explicitly in YAML. Since `--smoke` derives its quota
-from the simulator count, changing that count requires preserving the original
-quota in YAML and omitting `--smoke`. Source, Assets, Python, cache and output paths
-come from the current YAML, allowing migration to a new container.
+Stop the previous run, then add `--resume /path/to/stopped-run` to the original
+launch command, or set YAML `resume.from_dir`. Keep the following requirements:
 
-Resume uses acknowledged events and the frozen config, checking recorded runtime
-dependencies, asset contents and the model fingerprint. Repository commits and
-source snapshots do not gate resume. Older manifests are checked against the
-runtime fields they recorded; opaque legacy source fingerprints are ignored.
-Provide `model_identity.json` via `model.result_dir` from the first run and
-again for the current model when
-resuming. Live GPU metrics are not required for identity validation.
-The frozen config expands inherited settings; the new run reuses it with current
-RoboDojo paths and rejects changes to the evaluation protocol. Native FluxVLA status
-currently reports readiness/queue state, not a model fingerprint or GPU samples.
-Ordinary evaluation works without these files; cross-run fingerprint verification
-and remote GPU statistics still use explicitly supplied external artifacts.
+- Preserve task selection, quotas and evaluation settings. Keep the original
+  `--full` or `--smoke` flag. If changing the worker count of a smoke run, set its
+  original task/quota explicitly in YAML and omit `--smoke`.
+- Supply `model_identity.json` through YAML `model.result_dir` on both the initial
+  and resumed runs. Native FluxVLA status does not supply this fingerprint;
+  provide it externally before the first run if recovery will be needed.
+  Ordinary evaluation does not require it; GPU telemetry is also optional.
+- Keep recorded dependencies, assets and model identity compatible. Source,
+  asset, Python and output paths may change in the current YAML; the launcher
+  checks the frozen evaluation settings. Repository commit IDs do not gate resume.
 
-- Completed episodes retain task/index, both seeds and the actual layout. Their
-  reports are replayed without inference.
-- Pending episodes are rebuilt from the canonical manifest, avoiding layouts
-  already used by completed episodes. Unrecorded rejected layouts may be checked
-  again. Worker restart budgets reset for the new run.
-- A resumed run can be resumed again without double counting. Accumulated time
-  includes only execution intervals observable in the journal, excluding downtime
-  and replay. Unrecorded time between the last event and interruption is unavailable.
-- Results go into a new directory under the current `run.output_root`; old records
-  remain intact. Do not start simultaneous evaluations on the same directory. The
-  launcher locks directories and checks whether the source run is still active.
+Completed episodes retain their outcomes, seeds and layouts and are replayed
+without inference. Pending episodes avoid layouts already used by completed
+ones. Results go into a new directory; the previous run remains intact.
+Do not run simultaneous evaluations against the same output directory.
 
-## Compatibility and Troubleshooting
+## Troubleshooting
 
-The [PhysX log adapter](../fluxthemis/environments/sim/robodojo_log_capture.py)
-writes native stdout/stderr to ordinary files, avoiding a full pipe blocking a
-writer while the Python reader waits for the GIL. Existing error parsing and the
-watchdog remain, and logs are forwarded to `simulator.log`. Each worker uses
-separate Kit data, log and extension-cache directories to avoid concurrent writes
-to shared caches.
-
-### IsaacLab Signal Patch and Interface Checks
-
-Older IsaacLab `AppLauncher` versions register Python callbacks for
-`SIGTERM/SIGABRT/SIGSEGV` that call `SimulationApp.close()`. Reentrant or stalled
-shutdown can prevent the supervisor from reclaiming the worker. See
-[IsaacLab #7774](https://github.com/isaac-sim/IsaacLab/issues/7774) and
-[PR #8068](https://github.com/isaac-sim/IsaacLab/pull/8068).
-
-The `_launch_worker_app` / `_WorkerAppSignals` patch in
-[robodojo.py](../fluxthemis/environments/sim/robodojo.py) temporarily proxies the
-launcher's `signal` reference during construction, skips registration of the old
-callback for those three signals, then restores the reference. Other registrations
-pass through, preserving Kit's native crash handling and normal shutdown. Setting
-all fatal signals to `SIG_DFL` after startup would override native handling.
-
-These private interfaces vary across IsaacLab/RoboDojo versions. Even a deployment
-with a fixed image must retain the following checks against the loaded implementation:
-
-| Check | Purpose and limit |
+| Symptom | Action |
 | --- | --- |
-| `_abort_signal_handle_callback` exists | Otherwise call the original launcher; absence does not prove an upstream fix |
-| `module.signal is signal` | Verify the proxied module is the expected one; fail clearly on mismatch |
-| `handler.__func__` matches the target callback | Filter only the old callback registration and preserve other handlers |
-| Monitor attributes required by `FileLogCapture` | Check the RoboDojo PhysX parsing/watchdog structure |
+| Missing assets or `X5A.urdf is not a file` | Check `$ROBODOJO_ROOT/Assets` and regenerate robot paths after moving files. |
+| Missing camera interfaces or reset fix | Use the installer-selected source and run the preparation commands above. |
+| Model connection fails | Check the address from inside the Sim container, the ZMQ port and any existing tunnel. |
+| Worker startup times out | Inspect `simulator.log` with one worker first; adjust YAML `model.wait_seconds` if startup needs longer. Direct `distributed_eval.sh` uses `--startup-timeout-s`. |
+| `Unsupported IsaacLab signal registration` or `Unsupported RoboDojo PhysX monitor` | Check the installed dependency versions against the supported installer setup. Preserve Kit logs and crash dumps for diagnosis. |
 
-Structural checks do not replace environment validation. For
-`Unsupported IsaacLab signal registration` or `Unsupported RoboDojo PhysX monitor`,
-inspect the actual source and dependency versions. Remove the signal patch only
-after all supported environments use a verified upstream fix; assess the log
-adapter separately.
-
-The signal patch addresses exit after failure. It does not guarantee SIGTERM
-behavior in every environment or eliminate native crashes and all deadlocks.
-The supervisor still lacks independent startup/shutdown timeouts with forced
-reclamation. If initialization stalls, use one GPU/worker to isolate AppLauncher,
-library imports, cuRobo, reset or shutdown. Before stopping a failed container,
-preserve `.dmp`, `.dmp.toml`, `.py.txt` and Kit logs from its temporary directories.
-
-## Full Task List
-
-
-Each generalization task and its `_random` variant have 25 episodes each,
-50 per pair. All other tasks have 50 episodes. Task IDs below are case-sensitive
-and can be passed directly to the launcher.
-
-### Generalization
-
-| Task ID | Episodes |
-| --- | ---: |
-| `stack_bowls` | 25 |
-| `push_T` | 25 |
-| `pack_objects_into_box` | 25 |
-| `fold_clothes` | 25 |
-| `hang_mugs` | 25 |
-| `sweep_blocks` | 25 |
-| `pour_liquid_into_cup` | 25 |
-| `make_toast` | 25 |
-| `arrange_largest_number` | 25 |
-| `sort_nesting_dolls_by_size` | 25 |
-| `store_laptop_and_headphones` | 25 |
-| `stack_blocks` | 25 |
-| `stack_bowls_random` | 25 |
-| `push_T_random` | 25 |
-| `pack_objects_into_box_random` | 25 |
-| `fold_clothes_random` | 25 |
-| `hang_mugs_random` | 25 |
-| `sweep_blocks_random` | 25 |
-| `pour_liquid_into_cup_random` | 25 |
-| `make_toast_random` | 25 |
-| `arrange_largest_number_random` | 25 |
-| `sort_nesting_dolls_by_size_random` | 25 |
-| `store_laptop_and_headphones_random` | 25 |
-| `stack_blocks_random` | 25 |
-
-### Memory
-
-| Task ID | Episodes |
-| --- | ---: |
-| `cover_blocks` | 50 |
-| `match_and_pick_from_conveyor` | 50 |
-| `swap_blocks` | 50 |
-| `swap_T` | 50 |
-| `press_by_number` | 50 |
-| `imitate_sorting_sequence` | 50 |
-
-### Precision
-
-| Task ID | Episodes |
-| --- | ---: |
-| `fasten_screws` | 50 |
-| `plug_in_charger` | 50 |
-| `insert_tubes` | 50 |
-| `pour_balls_into_vase` | 50 |
-| `play_Xylophone` | 50 |
-| `deposit_coin` | 50 |
-| `insert_key` | 50 |
-| `build_tower` | 50 |
-
-### Long-horizon
-
-| Task ID | Episodes |
-| --- | ---: |
-| `fill_pen_holder` | 50 |
-| `classify_objects` | 50 |
-| `put_bottles_into_dustbin` | 50 |
-| `play_tic_tac_toe` | 50 |
-| `fill_egg_holder` | 50 |
-| `organize_table` | 50 |
-| `make_kong` | 50 |
-| `play_stacking_toy` | 50 |
-
-### Open
-
-| Task ID | Episodes |
-| --- | ---: |
-| `align_blocks` | 50 |
-| `general_pickup` | 50 |
-| `solve_equation` | 50 |
-| `stack_blocks_by_language` | 50 |
-| `classify_objects_by_language` | 50 |
-| `pick_from_conveyor_by_image` | 50 |
-| `store_tools_in_toolbox` | 50 |
-| `pour_by_language` | 50 |
+The supervisor terminates and replaces workers that exceed the configured startup
+timeout. For fatal simulation failures, it restarts the affected worker and
+retries its episode; the direct launcher exposes `--simulator-restart-limit` to
+bound coordinator retries. Repeated failures require checking the simulator logs.
