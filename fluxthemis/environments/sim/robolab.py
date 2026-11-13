@@ -30,6 +30,18 @@ from ..base import BaseEnvironment
 from .robolab_metrics import collect_episode_metrics
 
 
+class NonFiniteObservationError(ValueError):
+    """Nonfinite simulator state, distinct from shape errors."""
+
+    def __init__(self, field, lane, shape, invalid_indices):
+        super().__init__(f'{field} contains nonfinite values in lane {lane}')
+        self.details = dict(
+            field=field,
+            lane=int(lane),
+            shape=list(shape),
+            invalid_indices=invalid_indices)
+
+
 def _load_prelaunch_runtime():
     try:
         # Required by RoboLab before importing IsaacLab / starting Kit.
@@ -127,7 +139,7 @@ def _single(value, name):
 
 @ENVIRONMENTS.register_module()
 class RoboLabEnvironment(BaseEnvironment):
-    """DROID adapter using the official scalar or native batch lifecycle.
+    """DROID adapter using the official scalar lifecycle.
 
     A worker owns one Isaac application. Consecutive episodes of the same task
     reuse the native environment; changing tasks closes and recreates it.
@@ -205,9 +217,9 @@ class RoboLabEnvironment(BaseEnvironment):
                                      cpu_thread_limit, 'cpu_thread_limit'))
         if self.cpu_thread_limit == 0:
             raise ValueError('cpu_thread_limit must be positive')
-        self.batch_size = _nonnegative_integer(num_envs, 'num_envs')
-        if self.batch_size == 0:
-            raise ValueError('num_envs must be positive')
+        self.num_envs = _nonnegative_integer(num_envs, 'num_envs')
+        if self.num_envs != 1:
+            raise ValueError('num_envs must be 1')
         if not isinstance(headless, bool):
             raise TypeError('headless must be a boolean')
         self.headless = headless
@@ -400,8 +412,6 @@ class RoboLabEnvironment(BaseEnvironment):
               environment_seed: int | None,
               environment_case_index: int | None) -> tuple[dict, dict]:
         self._require_setup()
-        if self.batch_size != 1:
-            raise RuntimeError('Use reset_batch for a native batch')
         if not isinstance(task, TaskSpec):
             raise TypeError('task must be a TaskSpec')
         if task.task_id not in self._task_ids:
@@ -466,12 +476,12 @@ class RoboLabEnvironment(BaseEnvironment):
             task_id,
             device=f'cuda:{self.device_id}',
             seed=self.simulator_seed,
-            num_envs=self.batch_size,
+            num_envs=self.num_envs,
             instruction_type='default',
             renderer=self.renderer,
             rendering_mode=self.rendering_mode)
-        if self._env.num_envs != self.batch_size:
-            raise ValueError('RoboLab native num_envs differs from batch_size')
+        if self._env.num_envs != self.num_envs:
+            raise ValueError('RoboLab native num_envs differs from num_envs')
         if self._env.action_manager.total_action_dim != 8:
             raise ValueError('DROID jointpos must expose 8 action values')
         self._max_steps = _nonnegative_integer(self._env.max_episode_length,
@@ -485,32 +495,30 @@ class RoboLabEnvironment(BaseEnvironment):
         self._active_task_id = task_id
         self._instance_episode = 0
 
-    def _observation(self, raw, env_id=0):
+    def _observation(self, raw):
         if not isinstance(raw, Mapping):
             raise TypeError('RoboLab observation must be a mapping')
         flat = {}
         for output, source in self.camera_keys.items():
             images = raw['image_obs'][source]
-            if (len(images.shape) != 4 or images.shape[0] != self.batch_size
+            if (len(images.shape) != 4 or images.shape[0] != self.num_envs
                     or images.shape[-1] != 3 or min(images.shape[1:3]) == 0):
                 raise ValueError(f'{source} must be [N,H,W,3] RGB uint8')
-            image = _numpy(images[env_id])
+            image = _numpy(images[0])
             if image.dtype != np.uint8:
                 raise ValueError(f'{source} must be [N,H,W,3] RGB uint8')
             flat[output] = image.copy()
         parts = []
         for key, width in zip(self.state_keys, (7, 1)):
             values = raw['proprio_obs'][key]
-            if tuple(values.shape) != (self.batch_size, width):
+            if tuple(values.shape) != (self.num_envs, width):
                 raise ValueError(f'{key} must be finite numeric [N,{width}]')
-            part = _numpy(values[env_id])
+            part = _numpy(values[0])
             if part.dtype.kind not in 'fiu':
                 raise ValueError(f'{key} must be finite numeric [N,{width}]')
             if not np.isfinite(part).all():
-                from fluxthemis.environments.base import \
-                    NonFiniteObservationError
                 raise NonFiniteObservationError(
-                    key, env_id, values.shape,
+                    key, 0, values.shape,
                     np.argwhere(~np.isfinite(part)).tolist())
             parts.append(part)
         flat['states'] = np.concatenate(parts).copy()
@@ -519,8 +527,6 @@ class RoboLabEnvironment(BaseEnvironment):
 
     def step(self, action: Any) -> StepResult:
         self._require_setup()
-        if self.batch_size != 1:
-            raise RuntimeError('Use step_batch for a native batch')
         if not self._episode_active:
             raise RuntimeError(
                 'Call reset(): episode has not started or ended')
@@ -605,16 +611,6 @@ class RoboLabEnvironment(BaseEnvironment):
             success=success,
             score=score,
             info=info)
-
-    def reset_batch(self, task, episode_indices, *, environment_seeds,
-                    environment_case_indices):
-        from .robolab_batch import reset_batch
-        return reset_batch(self, task, episode_indices, environment_seeds,
-                           environment_case_indices)
-
-    def step_batch(self, actions):
-        from .robolab_batch import step_batch
-        return step_batch(self, actions)
 
     def render(self):
         if self._last_observation is None:

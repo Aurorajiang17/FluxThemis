@@ -83,8 +83,8 @@ def test_zero_restart_limit_does_not_launch_replacement(monkeypatch):
         'deployment',
         '-1',
         episode_timeout_s=1,
-        restart_limit=0)
-    with pytest.raises(RuntimeError, match='restart limit'):
+        restart_on_failure=False)
+    with pytest.raises(RuntimeError, match='restarting is disabled'):
         supervisor.run()
     assert len(processes) == 1
 
@@ -226,3 +226,140 @@ def test_launcher_forwards_startup_timeout(monkeypatch, startup_timeout):
         startup_timeout_s=startup_timeout)
     assert supervisor.call_args.kwargs['startup_timeout_s'] == startup_timeout
     supervisor.return_value.run.assert_called_once_with()
+
+
+@pytest.mark.parametrize('state', [
+    'init', 'idle', 'episode', 'timeout', 'exit_zero', 'exit_nonzero',
+    'shutdown'
+])
+def test_real_child_zero_restarts_and_reaping(monkeypatch, tmp_path, state):
+    import multiprocessing
+    import os
+    import time
+    context = multiprocessing.get_context('fork')
+    monkeypatch.setattr(worker.multiprocessing, 'get_context',
+                        lambda _: context)
+    record = tmp_path / 'children'
+
+    def child(**kwargs):
+        record.write_text(f"{os.getpid()}:{kwargs['generation']}")
+        if state not in ('init', 'timeout'):
+            kwargs['ready_event'].set()
+        if state == 'shutdown':
+            kwargs['stop_received'].set()
+            return
+        if state == 'timeout':
+            time.sleep(10)
+        else:
+            os._exit(0 if state == 'exit_zero' else 1)
+
+    monkeypatch.setattr(worker, '_run_simulator_worker', child)
+    supervisor = worker.SimulatorWorkerSupervisor(
+        'config.py',
+        'tcp://127.0.0.1:15558',
+        'worker',
+        'deployment',
+        '-1',
+        episode_timeout_s=1,
+        startup_timeout_s=0.1,
+        restart_on_failure=False)
+    if state == 'shutdown':
+        supervisor.run()
+    else:
+        with pytest.raises(RuntimeError, match='restarting is disabled'):
+            supervisor.run()
+    pid, generation = record.read_text().split(':')
+    assert generation == '0'
+    assert not os.path.exists(f'/proc/{pid}')
+    assert all(p.pid != int(pid) for p in multiprocessing.active_children())
+
+
+@pytest.mark.parametrize('limit,expected', [(0, False), (3, True), (7, True)])
+def test_launcher_passes_only_restart_boolean(monkeypatch, limit, expected):
+    from fluxthemis.engines.runners import launcher
+    supervisor = Mock()
+    monkeypatch.setattr(launcher, 'SimulatorWorkerSupervisor', supervisor)
+    launcher.run_distributed_evaluation_rank(
+        config_path='config.py',
+        device='-1',
+        rollout_bind='tcp://127.0.0.1:15558',
+        rollout_endpoint='tcp://127.0.0.1:15558',
+        rank=1,
+        world_size=2,
+        simulator_restart_limit=limit)
+    assert supervisor.call_args.kwargs['restart_on_failure'] is expected
+    assert 'restart_limit' not in supervisor.call_args.kwargs
+
+
+@pytest.mark.parametrize('failure', ['initialization', 'idle', 'episode'])
+def test_real_launcher_coordinator_and_worker_exit_bounded(
+        monkeypatch, tmp_path, failure):
+    import multiprocessing
+    import socket
+
+    from fluxthemis.engines.runners import config as config_module
+    from fluxthemis.engines.runners import launcher
+    from fluxthemis.environments.mock import MockEnvironment
+    from fluxthemis.model_clients.mock import MockPolicyClient
+    from fluxthemis.reporters.mock import MockEvaluationReporter
+    context = multiprocessing.get_context('fork')
+    monkeypatch.setattr(worker.multiprocessing, 'get_context',
+                        lambda _: context)
+    previous = {p.pid for p in multiprocessing.active_children()}
+
+    class Reporter(MockEvaluationReporter):
+
+        @property
+        def evaluation_report_run_dir(self):
+            return str(tmp_path / 'reported')
+
+    monkeypatch.setattr(config_module, 'build_evaluation_reporter_from_cfg',
+                        lambda _: Reporter())
+    environment = MockEnvironment(tasks=['A'], success_after=2)
+    if failure == 'initialization':
+
+        def broken_setup():
+            raise RuntimeError('synthetic initialization failure')
+
+        environment.setup = broken_setup
+    monkeypatch.setattr(worker, 'build_environment_from_cfg',
+                        lambda _: environment)
+    monkeypatch.setattr(worker, 'build_policy_client_from_cfg',
+                        lambda _: MockPolicyClient(action_dim=8, chunk_size=1))
+    if failure == 'idle':
+
+        def broken_receive(self, socket):
+            raise RuntimeError('synthetic idle failure')
+
+        monkeypatch.setattr(worker._SimulatorWorker, '_receive_job',
+                            broken_receive)
+    elif failure == 'episode':
+
+        def broken_execute(self, **kwargs):
+            raise RuntimeError('synthetic episode failure')
+
+        monkeypatch.setattr(worker._SimulatorWorker, '_execute_job',
+                            broken_execute)
+    config = tmp_path / 'config.py'
+    config.write_text('themis=dict(transport=dict(), evaluation=dict(\n'
+                      'environment=dict(type="MockEnvironment"),\n'
+                      'policy_client=dict(type="MockPolicyClient"),\n'
+                      'reporter=dict(type="MockEvaluationReporter"),\n'
+                      'evaluator=dict(type="SuccessRateEvaluator"),\n'
+                      'episodes_per_task=1, max_episode_steps=3))\n')
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        endpoint = f'tcp://127.0.0.1:{sock.getsockname()[1]}'
+    with pytest.raises(RuntimeError, match='restarting is disabled'):
+        launcher.run_distributed_evaluation_rank(
+            config_path=str(config),
+            device='-1',
+            rollout_bind=endpoint,
+            rollout_endpoint=endpoint,
+            rank=0,
+            world_size=1,
+            startup_timeout_s=3,
+            episode_timeout_s=1,
+            simulator_restart_limit=0,
+            deployment_id='real-process-test')
+    assert {p.pid for p in multiprocessing.active_children()} == previous

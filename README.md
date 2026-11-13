@@ -12,8 +12,7 @@ action denormalization, and authoritative benchmark artifacts.
 | FluxVLA | Model config, checkpoint, inference replicas, preprocessing, statistics, action units, authoritative evaluation journal and benchmark summary |
 | FluxThemis | Evaluation config, simulator assets and layouts, environment processes, episode scheduling, action execution, videos, progress, resource monitoring and resume |
 
-Every prediction request contains the complete observation and prompt. The
-RoboLab process entry uses independent persistent model streams. With
+Every prediction request contains the complete observation and prompt. With
 the default dynamic scheduling, consecutive requests from one episode may run
 on different model workers. Fixed scheduling is also available when supported
 and configured on both sides.
@@ -65,21 +64,8 @@ bash scripts/install_robotwin.sh
 See [RoboTwin evaluation](docs/robotwin.md) for model and simulator startup,
 task selection and compatibility notes.
 
-For RoboLab DROID joint-position evaluation:
-
-```bash
-cd /root/projects/FluxThemis
-bash scripts/install_robolab.sh
-```
-
-The installer uses RoboLab's locked uv `isaac50` stack (Python 3.11,
-IsaacLab 2.2.0, Isaac Sim 5.0.0), downloads native LFS assets, and installs
-Themis in the simulator environment. Use `--python` for a prepared compatible
-simulator image or `--dry-run` to inspect the installation plan.
-
-See [RoboLab evaluation](docs/robolab.md) for dependency requirements, model
-service startup, native batching and device/cache configuration. RoboLab
-process evaluation does not support automatic retries or resume.
+For RoboLab, see [RoboLab remote evaluation](docs/robolab.md) for the official
+simulator installer and single-environment remote configuration.
 
 Each simulator installer installs the FluxThemis package into its target
 environment. A separate core environment is not required for evaluation.
@@ -102,15 +88,6 @@ YAML such as [configs/robodojo/remote.yaml](configs/robodojo/remote.yaml) or
 [configs/robotwin/remote.yaml](configs/robotwin/remote.yaml).
 YAML holds paths, GPU/worker counts, connection settings and output locations;
 `--smoke` and `--full` select the evaluation scope using the same config.
-
-RoboLab defaults to [process sampling](docs/robolab.md#default-process-workflow), using
-`scripts/run_robolab_process.py`. Logical streams and physical GPU allocation
-are separate: the portable template uses one GPU, and extra GPUs run streams
-concurrently. Other benchmarks retain their existing launch modes.
-
-The [DROID config](configs/robolab/droid.py) and
-[process template](configs/robolab/process.yaml) define the ten-lane RoboLab
-workflow. Follow the [RoboLab guide](docs/robolab.md) for model assets and quotas.
 
 Existing FluxVLA configs remain usable: the evaluation launcher reads their
 Themis evaluation settings without loading model weights. A combined config
@@ -351,5 +328,4 @@ pre-commit run --all-files
 ```
 
 See [LIBERO](docs/libero.md), [RoboCasa](docs/robocasa.md),
-[RoboDojo](docs/robodojo.md), [RoboTwin](docs/robotwin.md), and
-[RoboLab](docs/robolab.md).
+[RoboDojo](docs/robodojo.md), and [RoboTwin](docs/robotwin.md).

@@ -20,7 +20,7 @@ class ProcessTree:
             self.known[pid] = row[2]
 
     @staticmethod
-    def snapshot():
+    def snapshot(permission_errors=None):
         rows = {}
         # Avoid glob's exists/stat checks while short-lived processes exit.
         for name in os.listdir('/proc'):
@@ -34,12 +34,18 @@ class ProcessTree:
                 # Parent PID, process group and start time (guards PID reuse).
                 rows[int(path.parent.name)] = (int(fields[1]), int(fields[2]),
                                                int(fields[19]))
+            except PermissionError as error:
+                if permission_errors is None:
+                    raise
+                permission_errors.append(error)
             except (OSError, ValueError, IndexError):
                 continue
         return rows
 
-    def members(self):
-        rows = self.snapshot()
+    def members(self, permission_errors=None):
+        rows = (
+            self.snapshot()
+            if permission_errors is None else self.snapshot(permission_errors))
         owned = {
             pid
             for pid, started in self.known.items()
@@ -54,9 +60,12 @@ class ProcessTree:
         self.known = {pid: rows[pid][2] for pid in owned}
         return {pid: rows[pid] for pid in owned}
 
-    def signal_groups(self, signum):
+    def signal_groups(self, signum, permission_errors=None):
         # Only groups containing still-live, identity-checked descendants.
-        for group in {row[1] for row in self.members().values()}:
+        members = (
+            self.members()
+            if permission_errors is None else self.members(permission_errors))
+        for group in {row[1] for row in members.values()}:
             try:
                 os.killpg(group, signum)
             except ProcessLookupError:
@@ -179,14 +188,37 @@ class ProcessRunner:
                 return process.returncode
         finally:
             if process:
-                # torchrun workers have their own process groups/sessions.
-                tree.signal_groups(signal.SIGTERM)
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline:
-                    process.poll()
-                    if not tree.members():
-                        break
-                    time.sleep(.05)
-                else:
-                    tree.signal_groups(signal.SIGKILL)
-                process.wait(timeout=5)
+                # Keep cleaning readable, identity-checked descendants even
+                # if an unrelated /proc entry is denied. Report that denial
+                # after cleanup; it cannot certify a complete process scan.
+                permission_errors = []
+                try:
+                    if tree is not None:
+                        tree.signal_groups(signal.SIGTERM, permission_errors)
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            process.poll()
+                            if not tree.members(permission_errors):
+                                break
+                            time.sleep(.05)
+                        else:
+                            tree.signal_groups(signal.SIGKILL,
+                                               permission_errors)
+                finally:
+                    # Popen owns this unreaped child and its new session.
+                    # This also handles failure before ProcessTree exists.
+                    if process.poll() is None:
+                        try:
+                            os.killpg(process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(process.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                    process.wait(timeout=5)
+                if permission_errors:
+                    raise permission_errors[0]

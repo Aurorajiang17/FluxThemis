@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def launch(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
     monkeypatch.delenv('CUDA_VISIBLE_DEVICES', raising=False)
-    monkeypatch.delenv('ROBOLAB_ROOT', raising=False)
+    monkeypatch.setenv('ROBOLAB_ROOT', '/tmp/robolab-fixture')
     return importlib.import_module('run_evaluation')
 
 
@@ -23,9 +23,7 @@ def scalar_config(tmp_path):
     config = Config.fromfile(ROOT / 'configs/robolab/droid.py')
     evaluation = config.themis.evaluation
     evaluation.environment.num_envs = 1
-    evaluation.episode_batch_size = 1
     evaluation.episodes_per_task = 1
-    evaluation.policy_client.sampling_mode = 'episode_noise_stream_v1'
     path = tmp_path / 'scalar.py'
     config.dump(str(path))
     return path
@@ -88,32 +86,6 @@ def test_python_task_list_preserves_order(launch, tmp_path):
     evaluation = settings['config'].themis.evaluation
     assert evaluation.environment.task_name == tasks
     assert evaluation.episodes_per_task == 3
-
-
-def test_native_batch_launch_validates_before_simulation(launch, tmp_path):
-    path = write_launch(tmp_path, simulator_restart_limit=0)
-    options = {
-        'themis.evaluation.episode_batch_size': 10,
-        'themis.evaluation.episodes_per_task': 10,
-        'themis.evaluation.environment.num_envs': 10
-    }
-    settings = launch.load_config(path, overrides=dict(cfg_options=options))
-    assert settings['config'].themis.evaluation.episode_batch_size == 10
-    smoke = launch.load_config(
-        path,
-        mode='smoke',
-        overrides=dict(cfg_options=options, workers_per_gpu=2))
-    assert smoke['config'].themis.evaluation.episodes_per_task == 20
-    for key, value in [('themis.evaluation.episodes_per_task', 9),
-                       ('themis.evaluation.environment.num_envs', 1)]:
-        with pytest.raises(ValueError):
-            launch.load_config(
-                path, overrides=dict(cfg_options={
-                    **options, key: value
-                }))
-    with pytest.raises(ValueError, match='restart_limit=0'):
-        launch.load_config(
-            write_launch(tmp_path), overrides=dict(cfg_options=options))
 
 
 def test_root_precedence_and_child_environment(launch, tmp_path, monkeypatch):
@@ -469,7 +441,8 @@ if name == 'python' and stage == 'metadata':
     def version(package):
         if os.environ.get('INSTALL_BAD_STACK'):
             return '0.0.0'
-        return {'isaaclab': '2.2.0', 'isaacsim': '5.0.0'}[package]
+        return {'isaaclab': '2.2.0', 'isaacsim': os.environ.get(
+            'INSTALL_ISAACSIM_VERSION', '5.0.0')}[package]
     importlib.metadata.version = version
     exec(code)
 ''')
@@ -510,6 +483,8 @@ def test_installer_pinned_clone_and_asset_scope(installer, tmp_path):
     result = run('--env-path', env)
     assert result.returncode == 0, result.stderr
     assert (env / 'bin/python').is_symlink()
+    assert any(name == 'uv' and args[:2] == ['pip', 'install']
+               and 'websockets==12.0' in args for name, args in calls())
     assert (tmp_path /
             'new checkout/uv.lock').read_bytes() == (source /
                                                      'uv.lock').read_bytes()
@@ -519,6 +494,28 @@ def test_installer_pinned_clone_and_asset_scope(installer, tmp_path):
         for name, args in calls())
     assert any(name == 'python' and 'check_environment' in args[1]
                for name, args in calls())
+
+
+@pytest.mark.parametrize('version,accepted', [
+    ('5.0.0', True),
+    ('5.0.0.0', True),
+    ('5.0.0.0+vendor', True),
+    ('5.0.0.1', False),
+    ('5.0.1.0', False),
+    ('5.1.0.0', False),
+    ('5.0.0rc1', False),
+    ('5.0.0.post1', False),
+])
+def test_installer_accepts_only_isaac50_release(installer, tmp_path,
+                                                monkeypatch, version,
+                                                accepted):
+    run, calls, _, stub = installer
+    python = tmp_path / 'python'
+    python.symlink_to(stub)
+    monkeypatch.setenv('INSTALL_ISAACSIM_VERSION', version)
+    result = run('--python', python, '--skip-assets')
+    assert (result.returncode == 0) is accepted, result.stderr
+    assert any(name == 'uv' for name, _ in calls()) is accepted
 
 
 def test_installer_prepared_python_keeps_venv_path(installer, tmp_path):
@@ -591,3 +588,140 @@ def test_installer_plan_and_invalid_options_do_not_write(installer, tmp_path):
                  ('--python', '/x', '--env-path', '/y')]:
         assert run(*args).returncode != 0
     assert not calls()
+
+
+def test_proc_snapshot_tolerates_exit_but_preserves_permission_errors(
+        launch, monkeypatch):
+    from evaluation.runtime import ProcessTree
+    monkeypatch.setattr('os.listdir', lambda path: ['123', 'not-a-pid'])
+
+    def missing(path):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(Path, 'read_text', missing)
+    assert ProcessTree.snapshot() == {}
+
+    def denied(path):
+        raise PermissionError(path)
+
+    monkeypatch.setattr(Path, 'read_text', denied)
+    with pytest.raises(PermissionError):
+        ProcessTree.snapshot()
+
+
+def test_proc_members_does_not_adopt_reused_pid(launch, monkeypatch):
+    from evaluation.runtime import ProcessTree
+    monkeypatch.setattr(ProcessTree, 'snapshot',
+                        staticmethod(lambda: {10: (1, 10, 100)}))
+    tree = ProcessTree(10)
+    monkeypatch.setattr(
+        ProcessTree, 'snapshot',
+        staticmethod(lambda: {
+            10: (1, 10, 200),
+            11: (10, 10, 300)
+        }))
+    assert tree.members() == {}
+
+
+def test_direct_distributed_dry_run_reads_actual_evaluation_mapping(launch):
+    entry = importlib.import_module('distributed_eval')
+    assert entry.main([
+        '--config',
+        str(ROOT / 'configs/robolab/droid.py'), '--simulator-restart-limit',
+        '0', '--dry-run'
+    ]) == 0
+
+
+@pytest.mark.parametrize('extra', [
+    ['--simulator-restart-limit', '1'],
+    ['--resume-from', '/unused/recovery.json'],
+    ['--cfg-options', 'themis.evaluation.environment.num_envs=True'],
+    ['--cfg-options', 'themis.evaluation.environment.num_envs=2'],
+])
+def test_direct_distributed_rejects_robolab_incompatible_overrides(
+        launch, extra):
+    entry = importlib.import_module('distributed_eval')
+    with pytest.raises(ValueError, match='RoboLab'):
+        entry.main([
+            '--config',
+            str(ROOT / 'configs/robolab/droid.py'),
+            '--simulator-restart-limit', '0', '--dry-run', *extra
+        ])
+
+
+def test_existing_launch_plans_keep_shared_retry_and_timeout_defaults(
+        launch, tmp_path):
+    settings = launch.load_config(write_launch(tmp_path))
+    local = dict(settings['local'])
+    local.pop('episode_timeout_s')
+    local.pop('simulator_restart_limit')
+    local['frozen_config'] = str(tmp_path / 'snapshot.py')
+    local['python'] = '/usr/bin/python3'
+    plan = dict(
+        local=local,
+        run='existing-plan',
+        output=str(tmp_path),
+        wait_s=1800,
+        endpoint='tcp://127.0.0.1:15555')
+    arguments = launch.simulator_arguments(plan)
+    assert arguments[arguments.index('--episode-timeout-s') + 1] == '3600'
+    assert arguments[arguments.index('--simulator-restart-limit') + 1] == '3'
+
+
+@pytest.mark.parametrize('after_snapshot', [False, True])
+def test_proc_permission_failure_reaps_owned_process_and_preserves_error(
+        launch, tmp_path, monkeypatch, after_snapshot):
+    import subprocess
+    import sys
+
+    from evaluation.runtime import ProcessRunner, ProcessTree
+
+    runner = ProcessRunner(
+        dict(
+            local=dict(python=sys.executable, port=15558),
+            output=str(tmp_path)))
+    processes = []
+    popen = subprocess.Popen
+    read_text = Path.read_text
+
+    def capture(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def denied(path, *args, **kwargs):
+        if path.parts[:2] == ('/', 'proc'):
+            raise PermissionError('restricted process table')
+        return read_text(path, *args, **kwargs)
+
+    if after_snapshot:
+        # Deny one unrelated entry only after the initial complete snapshot.
+        snapshot = ProcessTree.snapshot
+        completed = False
+
+        def late_denial(permission_errors=None):
+            nonlocal completed
+            if completed:
+                if permission_errors is None:
+                    raise PermissionError('restricted process table')
+                permission_errors.append(
+                    PermissionError('restricted process table'))
+            completed = True
+            return snapshot()
+
+        monkeypatch.setattr(ProcessTree, 'snapshot', staticmethod(late_denial))
+    else:
+        monkeypatch.setattr(Path, 'read_text', denied)
+    monkeypatch.setattr(subprocess, 'Popen', capture)
+    try:
+        with pytest.raises(PermissionError, match='restricted process table'):
+            runner.run_logged(
+                [sys.executable, '-c', 'import time; time.sleep(10)'],
+                tmp_path / 'permission.log', None, 2)
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)

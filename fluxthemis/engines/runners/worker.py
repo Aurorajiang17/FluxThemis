@@ -22,7 +22,6 @@ from fluxthemis.structures import TaskSpec
 from ...transports.zmq_protocol import (decode_frame, decode_header,
                                         empty_payload, encode_frame,
                                         encode_header)
-from .batch_episode import execute_episode_batch
 from .config import (distributed_video_settings,
                      load_distributed_evaluation_config)
 from .episode import EpisodeJob, configure_worker_lifetime, execute_episode
@@ -42,7 +41,10 @@ class SimulatorWorkerSupervisor:
                  episode_timeout_s: float,
                  config_overrides: Mapping[str, Any] | None = None,
                  startup_timeout_s: float = _SIMULATOR_STARTUP_TIMEOUT_S,
-                 restart_limit: int | None = None) -> None:
+                 restart_on_failure: bool = True) -> None:
+        if not isinstance(restart_on_failure, bool):
+            raise TypeError("restart_on_failure must be a bool")
+        self.restart_on_failure = restart_on_failure
         self.config_path = config_path
         self.rollout_endpoint = _endpoint(rollout_endpoint, 'rollout_endpoint')
         self.worker_id = _nonempty(worker_id, 'worker_id')
@@ -53,10 +55,6 @@ class SimulatorWorkerSupervisor:
         self.startup_timeout_s = _positive_float(startup_timeout_s,
                                                  'startup_timeout_s')
         self.config_overrides = dict(config_overrides or {})
-        if restart_limit is not None and (type(restart_limit) is not int
-                                          or restart_limit < 0):
-            raise ValueError('restart_limit must be nonnegative or None')
-        self.restart_limit = restart_limit
         self._context = multiprocessing.get_context('spawn')
 
     def run(self) -> None:
@@ -115,11 +113,10 @@ class SimulatorWorkerSupervisor:
                 return
             restart_reason = ('startup timeout' if startup_timed_out else
                               f'exit code {process.exitcode}')
-            if (self.restart_limit is not None
-                    and generation >= self.restart_limit):
+            if not self.restart_on_failure:
                 raise RuntimeError(
-                    f'{self.worker_id} failed: {restart_reason}; '
-                    'simulator restart limit reached')
+                    f'Simulator {self.worker_id} failed ({restart_reason}); '
+                    'restarting is disabled')
             generation += 1
             print(
                 f'[FluxThemis] restarting {self.worker_id} after '
@@ -168,7 +165,6 @@ class _SimulatorWorker:
         socket.connect(self.rollout_endpoint)
         environment: BaseEnvironment | None = None
         policy_client: BasePolicyClient | None = None
-        policy_clients = []
         # Save stderr before simulator redirection, so Python failures reach
         # the supervisor's log before os._exit bypasses normal cleanup.
         error_fd = os.dup(2)
@@ -185,29 +181,13 @@ class _SimulatorWorker:
             environment.configure_video_recording(save_videos, video_dir)
             policy_client = build_policy_client_from_cfg(
                 evaluation_cfg['policy_client'])
-            policy_clients.append(policy_client)
             policy_client.setup()
-            size = environment.batch_size
-            if size != evaluation_cfg.get('episode_batch_size', 1):
-                raise ValueError(
-                    'Environment and evaluation batch_size differ')
-            if size > 1 and save_videos:
-                raise ValueError(
-                    'Video recording is unsupported for native batches')
-            for _ in range(1, size):
-                client = build_policy_client_from_cfg(
-                    evaluation_cfg['policy_client'])
-                policy_clients.append(client)
-                client.setup()
             environment.setup()
             tasks = tuple(
                 TaskSpec.from_value(task) for task in environment.tasks())
             socket.send_multipart([
                 encode_header('ready', **self._message_identity),
-                encode_frame({
-                    'tasks': [to_jsonable(task) for task in tasks],
-                    'batch_size': size
-                }),
+                encode_frame({'tasks': [to_jsonable(task) for task in tasks]}),
             ])
             self.ready_event.set()
             while True:
@@ -217,12 +197,6 @@ class _SimulatorWorker:
                     # A zero exit is normal only after this protocol message.
                     self.stop_received.set()
                     return
-                if isinstance(job, tuple):
-                    self._execute_batch(socket, environment, policy_clients,
-                                        evaluation_cfg, job)
-                    continue
-                if size != 1:
-                    raise RuntimeError('Batch environment received scalar job')
                 self._execute_job(
                     socket=socket,
                     environment=environment,
@@ -246,7 +220,7 @@ class _SimulatorWorker:
             finally:
                 os._exit(1)
         finally:
-            for component in (environment, *policy_clients):
+            for component in (environment, policy_client):
                 if component is None:
                     continue
                 try:
@@ -267,20 +241,12 @@ class _SimulatorWorker:
             empty_payload(),
         ])
 
-    def _receive_job(self, socket: Any) -> EpisodeJob | tuple | None:
+    def _receive_job(self, socket: Any) -> EpisodeJob | None:
         frames = socket.recv_multipart()
         header = decode_header(frames[0])
         self._validate_header(header)
         if header['type'] == 'shutdown_worker':
             return None
-        if header['type'] == 'episode_batch':
-            payload = decode_frame(frames[1])
-            if not isinstance(payload, list) or not payload:
-                raise TypeError('episode batch must be a nonempty list')
-            jobs = tuple(_episode_job_from_wire(value) for value in payload)
-            if header.get('episode_ids') != [job.episode_id for job in jobs]:
-                raise RuntimeError('simulator batch episode IDs mismatch')
-            return jobs
         if header['type'] != 'episode_job':
             raise RuntimeError(
                 f'Unexpected simulator command {header["type"]!r}')
@@ -289,26 +255,6 @@ class _SimulatorWorker:
         if header.get('episode_id') != job.episode_id:
             raise RuntimeError('simulator episode_id mismatch')
         return job
-
-    def _execute_batch(self, socket, environment, clients, evaluation_cfg,
-                       jobs):
-        with _episode_timeout(self.episode_timeout_s):
-            execute_episode_batch(
-                environment,
-                clients,
-                jobs,
-                int(evaluation_cfg['max_episode_steps']),
-                evaluation_cfg.get('execute_horizon'),
-                bool(evaluation_cfg.get('stop_on_success', True)),
-                on_episode_started=lambda job: _send_episode_event(
-                    socket, self._message_identity, 'episode_start', job.
-                    episode_id),
-                on_episode_finished=lambda job, result: _send_episode_event(
-                    socket,
-                    self._message_identity,
-                    'episode_end',
-                    job.episode_id,
-                    payload=encode_frame(to_jsonable(result))))
 
     def _execute_job(self, *, socket: Any, environment: BaseEnvironment,
                      policy_client: BasePolicyClient,

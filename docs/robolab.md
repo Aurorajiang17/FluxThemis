@@ -1,260 +1,119 @@
-# RoboLab Integration
+# RoboLab remote evaluation
 
-RoboLab and Isaac Sim run in FluxThemis simulator workers. Themis selects tasks,
-advances native environments and reports results; FluxVLA model workers receive
-observations over ZMQ and return environment-unit actions. Simulator assets
-belong on the simulator side; weights, tokenizer and statistics belong on the
-model side. Each side uses its own prepared Python environment.
+## 1. Prerequisites and installation
 
-- [Environment and model preparation](#environment-and-model-preparation)
-- [Evaluation data and quotas](#evaluation-data-and-quotas)
-- [Launch and network](#launch-and-network)
-- [Progress and results](#progress-and-results)
-- [Compatibility and troubleshooting](#compatibility-and-troubleshooting)
-
-## Environment and Model Preparation
-
-Cloud model and simulator tasks use the Python environment from their own image.
-Simulation requires an NVIDIA RTX/RT-capable GPU and working Vulkan drivers;
-compute-only GPUs such as A100/A800 can run the model. Shared code can be
-installed into a task's environment independently of the model environment.
-
-### Install
-
-Prepare Git, Git LFS, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-ffmpeg and the host's graphics drivers, then run:
+RoboLab requires an NVIDIA RTX GPU and recommends at least 48 GB VRAM.
+See [RoboLab requirements](https://github.com/NVlabs/RoboLab#requirements);
+memory usage also depends on the model and recording settings.
+Prepare Git, Git LFS, uv, NVIDIA/Vulkan drivers and simulator assets.
+The [installer](../scripts/install_robolab.sh) selects RoboLab's locked
+Python 3.11 / Isaac Sim 5.0 / IsaacLab 2.2 stack.
+Prepare an independent model service using the companion
+[FluxVLA RoboLab guide](https://github.com/Aurorajiang17/FluxVLA/blob/a5dea4674a0fcf1f8a8a74dd4b847b04a15d8089/docs/robolab_remote_evaluation.md)
+at its fixed companion commit. In an existing FluxVLA checkout, fetch and
+select that version before following the guide:
 
 ```bash
-cd /root/projects/FluxThemis
-bash scripts/install_robolab.sh --dry-run
-bash scripts/install_robolab.sh
+git -C /path/to/FluxVLA fetch https://github.com/Aurorajiang17/FluxVLA.git a5dea4674a0fcf1f8a8a74dd4b847b04a15d8089
+git -C /path/to/FluxVLA checkout --detach a5dea4674a0fcf1f8a8a74dd4b847b04a15d8089
 ```
 
-The [installer](../scripts/install_robolab.sh) creates a sibling RoboLab checkout
-at revision `9cce00cadd5dc575fd2b8ea3836f5bdcde574229`, uses its official locked
-`uv sync --extra isaac50` workflow, and installs RoboLab and FluxThemis into the
-same simulator environment. The default is `RoboLab/.venv`: Python 3.11,
-IsaacLab 2.2.0 and Isaac Sim 5.0.0. Git LFS downloads only `assets/**`.
-Package consistency and static task/asset checks run after installation.
-The installer does not start a simulator or model.
-
-Existing simulator images can supply their own compatible Python:
+Run the following installer from the FluxThemis checkout:
 
 ```bash
-bash scripts/install_robolab.sh \
-  --robolab-root /path/to/RoboLab --python /path/to/simulator-env/bin/python
+export ROBOLAB_ROOT=/path/to/RoboLab
+bash scripts/install_robolab.sh --robolab-root "$ROBOLAB_ROOT"
+export ROBOLAB_PYTHON="$ROBOLAB_ROOT/.venv/bin/python"
+export FLUXTHEMIS_PYTHON="$ROBOLAB_PYTHON"
+# After accepting NVIDIA's license, set this for headless evaluation:
+export OMNI_KIT_ACCEPT_EULA=YES
 ```
 
-Use `--env-path` to place a uv environment elsewhere, or `--python` to add the
-packages to an already prepared environment without running uv sync. These
-options are mutually exclusive. `--skip-assets` skips both downloading and
-static asset verification; prepare and verify those assets before evaluation.
-Existing checkouts must match `ROBOLAB_REF` and have no tracked edits. The
-installer preserves their revision and refuses conflicting sources or Python
-versions. `ROBOLAB_ROOT`, `ROBOLAB_REPO` and `ROBOLAB_REF` select source paths
-and revisions; other revisions require separate compatibility validation.
+See [NVIDIA's headless license requirement](https://docs.isaacsim.omniverse.nvidia.com/5.0.0/installation/install_python.html).
+The installer does not accept the license or start simulation. It reconciles
+Isaac kernel dependency requirements before checking the environment.
+Use --env-path for a separate environment, or --python to install into an
+existing compatible one. Static preflight cannot prove rendering or physics.
 
-Activate the default simulator environment or select it explicitly:
+## 2. Configuration and execution
+
+Start the matching model service independently, following its RoboLab guide.
+Copy [remote.yaml](../configs/robolab/remote.yaml) and set the simulator
+interpreter/root, model endpoint, GPU, worker count and output directory.
+The default [droid.py](../configs/robolab/droid.py) runs every task for ten
+serial episodes with one simulator worker and one dedicated model service.
+FluxThemis connects to that service through the shared launcher.
+
+For N GPUs, the companion FluxVLA guide provides a fixed_worker service and
+the corresponding frozen YAML. Set the same GPU list on both sides,
+workers_per_gpu: 1, scheduling: fixed and model.expected_workers: N.
+Each GPU runs one simulator worker and one persistent model instance.
+GPU IDs or full GPU UUIDs may be used. Use the guide's common launch procedure
+for this mode; the commands below use the default single-worker YAML.
 
 ```bash
-export ROBOLAB_ROOT=/root/projects/RoboLab
-export FLUXTHEMIS_PYTHON="$ROBOLAB_ROOT/.venv/bin/python"
-source "$ROBOLAB_ROOT/.venv/bin/activate"
+bash scripts/run_evaluation.sh --config configs/robolab/remote.yaml --dry-run
+bash scripts/run_evaluation.sh --config configs/robolab/remote.yaml --smoke
+# Start a fresh model service before full evaluation.
+bash scripts/run_evaluation.sh --config configs/robolab/remote.yaml --full
 ```
 
-Use this Python directly after installing Themis. A later exact `uv sync` can
-remove packages added outside RoboLab's lockfile; rerun the installer to restore
-the combined environment. Both environments need compatible ZMQ protocols;
-Themis installs its shared Python dependencies from `requirements.txt`.
+Smoke selects BananaInBowlTask and one episode; full selects all tasks.
+Without either mode flag, the default YAML selects all tasks and ten episodes.
+episodes: null preserves the Python-configured episode quota.
+The base config accepts the entire returned action chunk. The optional
+[droid_h16.py](../configs/robolab/droid_h16.py) executes fifteen actions for
+a matching sixteen-output/fifteen-execution recipe. Choose the config from
+the model's exported action definition and deployment horizon.
+See the [shared evaluation guide](../guides/evaluation.md) for networking,
+monitoring and launcher overrides. Direct
+[distributed_eval.py](../scripts/distributed_eval.py) use requires
+--simulator-restart-limit 0 for RoboLab.
 
-### Required Configuration
+## 3. Evaluation protocol and limitations
 
-- The simulator uses the [RoboLab configs](../configs/robolab). The DROID
-  adapter accepts seven absolute arm joint targets and one gripper target,
-  with `over_shoulder_left_camera`, `wrist_cam` and `states` observations.
-- The selected FluxVLA checkout must provide the RoboLab dataset/recipes,
-  evaluation reporting and the matching `process_noise_stream_v1` protocol.
-  Process evaluation also requires the companion runtime controls. An older FluxVLA main branch may not provide
-  these capabilities; record both repositories' selected revisions.
-- For pi0.5, use the matching FluxVLA-compatible checkpoint, statistics and
-  tokenizer with the DROID inference recipe:
+Only num_envs=1 is supported. One Isaac application belongs to each worker.
+Within each worker, a task reuses its native environment for the episodes
+assigned to that worker, then closes it. Fixed assignment uses global task-major
+episode numbers: (episode_number - 1) % N, starting at one. Quotas are global
+per task, not multiplied by N; each task may have one instance per worker.
+Native instance_episode counts local reuse; it can differ from episode_index.
+Every episode resets native evaluation state and calls two native resets.
+The creation seed is retained; episode seed metadata does not reseed layouts.
 
-  | Variable | Model-side asset |
-  | --- | --- |
-  | `FLUXVLA_ROBOLAB_CHECKPOINT` | `model.safetensors` |
-  | `FLUXVLA_ROBOLAB_STATS` | `dataset_statistics.json` with the `robolab_droid` key |
-  | `FLUXVLA_ROBOLAB_TOKENIZER` | Matching `paligemma_tokenizer.model` |
+Observations contain RGB images under over_shoulder_left_camera and wrist_cam,
+and states: seven joint positions followed by the gripper position.
+The prompt is the native task instruction. The model returns finite numeric
+[T,8] DROID joint-position actions; the shared client has no fixed chunk length.
+Ordinary request metadata is used; no caller RNG state is transmitted.
 
-  [RoboLab's pi0-family guide](https://github.com/NVlabs/RoboLab/blob/9cce00cadd5dc575fd2b8ea3836f5bdcde574229/policies/pi0_family/README.md)
-  identifies the source checkpoint. Prepare the converted weights and statistics
-  according to the companion FluxVLA recipe; a JAX checkpoint or OpenPI
-  `norm_stats.json` is not a drop-in replacement for these files.
-- Model loading, precision, normalization, tokenizer and action horizon belong
-  to the model recipe. Other policies, including trained checkpoints, supply
-  their own matching recipe and convert outputs to the DROID action space.
-  Themis does not impose a model-internal dimension or prediction horizon.
+The companion continuous service keeps models alive across episodes and tasks.
+Readiness checks do not invoke inference. Each evaluation requires a fresh
+model deployment and audit file; see the FluxVLA guide for the service contract.
+Video is disabled by default. Technical retries are zero, including idle
+failures; resume is unsupported. Technical errors make the run incomplete.
+An ordinary unsuccessful task remains completed and counts in the results.
+Do not rerun normal failures or repair invalid actions.
+Single-environment request ordering requires new score measurements.
+Changing GPU count or task order also changes the sampling recipe and may
+change actions and scores. Keep these settings fixed when comparing models.
+The shared launcher requires a readable Linux /proc process table for all
+benchmarks. Permission failures remain errors after best-effort cleanup of
+owned processes; restricted process visibility cannot certify full cleanup.
 
-## Evaluation Data and Quotas
+## 4. Results
 
-### Assets and Storage
+The shared launcher prints the run directory and retains progress and logs.
+FluxVLA reporting stores the authoritative evaluation journal and summary.
+Native recordings remain under the environment output path in separate
+worker/task directories as run_<episode>.hdf5.
+Native frozen success, duration and terminal results remain authoritative.
+The native HDF5-derived Score is separate from the success rate.
 
-Native tasks, scenes, objects, robots and backgrounds come from the selected
-[RoboLab checkout](https://github.com/NVlabs/RoboLab/tree/9cce00cadd5dc575fd2b8ea3836f5bdcde574229).
-The installer materializes its LFS assets; training demonstrations and model
-checkpoints are not part of that download. Allocate storage separately for the
-Isaac environment, model assets, runtime caches and HDF5 results.
-
-Static preflight rejects missing required files and Git LFS pointers. It does
-not establish CUDA/Vulkan compatibility or resolve every binary/transitive
-USD/MDL reference; inspect its `unchecked_assets` and validate rendering on
-the target host. The [native task list](https://github.com/NVlabs/RoboLab/blob/9cce00cadd5dc575fd2b8ea3836f5bdcde574229/robolab/tasks/README.md)
-describes the pinned 120-task benchmark.
-
-### Episode Quotas
-
-The [DROID config](../configs/robolab/droid.py) uses ten native environments
-per worker and ten episodes per task: 1,200 episodes for the pinned benchmark.
-The [process template](../configs/robolab/process.yaml) selects all installed
-tasks, one logical stream, one GPU and **startup seed 0**. The model seeds once
-after loading and advances its default device stream across lanes, episodes
-and tasks. Native environment creation uses `simulator_seed=0`.
-
-Canonical report seeds identify episodes independently of dispatch order.
-Double reset, same-task reuse, native step limits and success rules are
-preserved. `execute_horizon=None` consumes the model's returned action chunk.
-
-## Launch and Network
-
-### Default Process Workflow
-
-The process entry manages a model service and simulator for each logical stream
-on one host, using their separate Python environments. It calls the existing
-public FluxVLA/Themis CLIs. Set the model asset variables above and these paths:
-
-```bash
-export FLUXVLA_ROOT=/root/projects/FluxVLA
-export FLUXVLA_PYTHON=/path/to/model-env/bin/python
-export ROBOLAB_ROOT=/root/projects/RoboLab
-export FLUXTHEMIS_PYTHON="$ROBOLAB_ROOT/.venv/bin/python"
-export ROBOLAB_EVAL_OUTPUT=/path/to/results
-export ROBOLAB_EVAL_CACHE=/path/to/cache
-cd /root/projects/FluxThemis
-```
-
-Accept NVIDIA's simulator license before setting `OMNI_KIT_ACCEPT_EULA=YES`.
-When running as root, set `allow_root: true` in your process YAML. Check its
-GPU/Vulkan mapping, CPU allocation and paths for the target host first.
-
-Inspect one-task settings, then execute its ten native episodes:
-
-```bash
-"$FLUXTHEMIS_PYTHON" scripts/run_robolab_process.py \
-  --tasks BananaInBowlTask --dry-run
-"$FLUXTHEMIS_PYTHON" scripts/run_robolab_process.py --tasks BananaInBowlTask
-```
-
-Dry-run writes the plan, expanded configs and commands without starting child
-processes, contacting services, initializing CUDA or allocating simulator
-caches. Removing `--tasks` selects the full benchmark:
-
-```bash
-"$FLUXTHEMIS_PYTHON" scripts/run_robolab_process.py
-```
-
-Task discovery is deterministic. `--num-streams` partitions the ordered task
-list into persistent model streams; physical GPUs can execute several complete
-streams sequentially. A two-GPU example, after verifying graphics ordinals:
-
-```bash
-"$FLUXTHEMIS_PYTHON" scripts/run_robolab_process.py \
-  --num-streams 2 --gpu-ids 0,1 --render-devices 0 1 --dry-run
-```
-
-The graphics ordinals are examples, not automatic discovery. Copy
-`process.yaml` to configure paths, CPU/port ranges, timeouts and `allow_root`.
-Relative paths resolve against that YAML. Set `simulator_config` to an absolute
-path when moving the template. `model_env` and `simulator_env` carry declared
-asset or binary dependency settings, without replacing Python imports or GPU
-routing. The default assigns two model CPUs and six simulator CPUs per GPU.
-
-An optional `streams` JSON manifest fixes canonical tasks and dispatch order:
-
-```json
-{
-  "version": 1,
-  "canonical_tasks": ["BananaInBowlTask", "MustardInRightBinTask"],
-  "episode_batch_size": 10,
-  "report_base_seed": 0,
-  "streams": [
-    {"id": 0, "tasks": ["MustardInRightBinTask"]},
-    {"id": 1, "tasks": ["BananaInBowlTask"]}
-  ]
-}
-```
-
-Each task must appear exactly once; an explicit manifest cannot be combined
-with `--tasks` or `--num-streams`. `--process-seeds 0 1` selects two independent
-repetitions. Even logical streams use the supplied seed order, odd streams the
-reverse order; each stream exits before the next repetition starts on its GPU.
-Changing stream grouping or request order changes noise allocation.
-
-### Network
-
-The process entry creates independent loopback endpoints on one host. Each
-stream has one persistent model service and one simulator worker, using their
-own Python environments. Keep the generated model frontend/backend, simulator
-coordinator and rendezvous ports available and distinct.
-
-## Progress and Results
-
-Themis writes plans/config snapshots, events, progress, `result.json`, simulator
-logs and resource reports. FluxVLA writes the authoritative journal, per-task
-results and aggregate summaries. Keep both output roots. The process launcher
-checks complete task/lane coverage, canonical identities, matching journals,
-finite Scores and the model's continuous request sequence; `summary.json`
-contains results for each selected startup seed.
-
-Native HDF5 determines Score and trajectory metrics. Batch episodes are
-identified by `native_hdf5_path` and `native_demo_key`. Score and success are
-independent; EE speed uses simulation time rather than inference wall time.
-Undefined native metrics retain null values and reasons. Missing or unfinished
-recordings are errors, and missing episodes remain unscored.
-
-If a stream encounters a technical error, its processes stop and partial
-outputs are retained; other healthy streams continue. Missing episodes remain
-unscored, and an incomplete evaluation exits unsuccessfully. Automatic retries
-and resume are unsupported. Normal task failures remain valid results.
-
-## Compatibility and Troubleshooting
-
-- **Simulator versions:** the installer selects Python 3.11, IsaacLab 2.2.0
-  and Isaac Sim 5.0.0. Other Isaac versions may change physics and rendering;
-  they are not silently substituted by this installer.
-- **CUDA and Vulkan:** match `nvidia-smi --query-gpu=index,uuid --format=csv`
-  against `vulkaninfo --summary`. An isolated worker uses CUDA ordinal 0,
-  but its graphics ordinal can differ. `render_device_map` maps assigned GPU
-  tokens/UUIDs to verified Vulkan ordinals; missing entries are errors.
-- **Worker caches and threads:** `kit_cache_root` creates isolated worker
-  caches and must be writable, whitespace-free and separate from HDF5 output.
-  `cpu_thread_limit` controls supported simulator thread pools; CPU affinity
-  and resource admission remain deployment responsibilities.
-- **Kit arguments:** place space-separated `kit_args` in an inherited Python
-  config, for example `--allow-root --/renderer/multiGpu/enabled=false` when
-  running Kit as root. MMEngine's `DictAction` removes spaces, so these strings
-  should not be passed through `--cfg-options`. The process YAML exposes
-  `allow_root` for this setting.
-- **Native lifecycle:** workers reuse a task's environment, close it on task
-  changes, and perform `reset_eval_state()` followed by two resets. Finished
-  batch lanes freeze while others continue. Native results determine success;
-  reaching an outer guard without native results is an error.
-- **CPU versus runtime checks:** core tests and static preflight do not prove
-  rendering or full evaluation on another host. After installation, run a small
-  selected task on that host and inspect native recordings and both reports.
-
-Development checks use the existing repository commands:
-
-```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q test
-pre-commit run --all-files
-```
+Missing, malformed or interrupted artifacts remain incomplete errors.
+Match the model audit's completed request IDs with the episode journal's
+prediction_metadata. An accepted request without completion identifies an
+interrupted prediction, even if some task artifacts exist.
+In fixed mode, compare each rank's continuous request count and model instance
+as well. Requests can finish in a different order across ranks; one worker
+finishing its quota does not end the entire run.

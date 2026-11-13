@@ -228,6 +228,7 @@ def execute_episode(environment: BaseEnvironment,
                 if not isinstance(transition.info, Mapping):
                     raise TypeError('StepResult.info must be a mapping')
                 observation = transition.observation
+                policy_client.observe(observation)
                 episode_return += float(transition.reward)
                 steps += 1
                 latest_info = dict(transition.info)

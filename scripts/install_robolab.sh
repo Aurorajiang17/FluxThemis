@@ -110,13 +110,17 @@ if [[ -n "${ENV_PATH}" ]]; then
 fi
 # Metadata inspection avoids importing Isaac or initializing CUDA.
 run "${PYTHON}" -c 'import sys; from importlib.metadata import version
+from packaging.version import Version
 assert sys.version_info[:2] == (3, 11), "Python 3.11 required"
 assert version("isaaclab") == "2.2.0", "IsaacLab 2.2.0 required"
-assert version("isaacsim").split("+")[0] == "5.0.0", "Isaac Sim 5.0.0 required"'
+assert Version(version("isaacsim").split("+")[0]) == Version("5.0.0"), "Isaac Sim 5.0.0 required"'
 if [[ "${SKIP_ASSETS}" == 0 ]]; then
   run git -C "${ROBOLAB_ROOT}" lfs pull --include='assets/**' --exclude=''
 fi
-run uv pip install --python "${PYTHON}" -e "${ROBOLAB_ROOT}" -e "${PROJECT_ROOT}"
+# Isaac50 kernel wheel metadata pins websockets; the native lock omits it.
+# Apply this constraint only to the selected simulator environment.
+run uv pip install --python "${PYTHON}" -e "${ROBOLAB_ROOT}" -e "${PROJECT_ROOT}" \
+  "websockets==12.0"
 run uv pip check --python "${PYTHON}"
 if [[ "${SKIP_ASSETS}" == 0 ]]; then
   run env "PYTHONPATH=${PROJECT_ROOT}/scripts:${PROJECT_ROOT}" "${PYTHON}" -c \

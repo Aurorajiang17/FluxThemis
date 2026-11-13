@@ -293,115 +293,6 @@ def environment(runtime, tmp_path):
     env.close()
 
 
-class _BatchNative(_NativeEnvironment):
-
-    def __init__(self, size):
-        super().__init__()
-        self.num_envs = size
-        self.episode_length_buf = np.zeros(size, dtype=np.int64)
-        self.active_env_ids = list(range(size))
-        self.results = [
-            dict(env_id=i, success=None, step=None) for i in range(size)
-        ]
-        self.finish_steps = [3, 5, 6]
-
-    def reset_eval_state(self):
-        super().reset_eval_state()
-        self.active_env_ids = list(range(self.num_envs))
-        self.results = [
-            dict(env_id=i, success=None, step=None)
-            for i in range(self.num_envs)
-        ]
-
-    def reset(self, **kwargs):
-        raw, info = super().reset(**kwargs)
-        self.raw = {
-            group: {
-                key: np.repeat(value, self.num_envs, axis=0)
-                for key, value in fields.items()
-            }
-            for group, fields in raw.items()
-        }
-        return self.raw, info
-
-    def step(self, actions):
-        self.actions.append(actions.copy())
-        self.episode_length_buf += 1
-        for lane in tuple(self.active_env_ids):
-            if self.episode_length_buf[lane] == self.finish_steps[lane]:
-                self.results[lane] = dict(
-                    env_id=lane,
-                    success=lane != 1,
-                    step=int(self.episode_length_buf[lane]))
-                self.active_env_ids.remove(lane)
-        self.all_terminated = not self.active_env_ids
-        zeros = np.zeros(self.num_envs)
-        return self.raw, zeros, zeros, zeros, {}
-
-    def get_env_results(self):
-        return [dict(result) for result in self.results]
-
-
-def test_native_batch_freezes_lanes_and_preserves_reset_lifecycle(
-        runtime, tmp_path, monkeypatch):
-    from fluxthemis.environments.sim import robolab_batch
-    create = runtime.runtime.create_env
-
-    def batch_create(*args, **kwargs):
-        _, cfg = create(*args, **kwargs)
-        env = _BatchNative(kwargs['num_envs'])
-        runtime.created[-1] = (args[0], kwargs, env)
-        return env, cfg
-
-    runtime.runtime.create_env = batch_create
-    calls = []
-    monkeypatch.setattr(
-        robolab_batch, 'collect_episode_metrics',
-        lambda path, dt, success, steps, demo_key: (calls.append(
-            (demo_key, success, steps)) or 0.5, {}))
-    env = RoboLabEnvironment(
-        task_name=['TaskA', 'TaskB'], num_envs=3, output_dir=tmp_path)
-    env.setup()
-
-    def reset(task=0):
-        return env.reset_batch(
-            env.tasks()[task], [0, 1, 2],
-            environment_seeds=[7, 8, 9],
-            environment_case_indices=[0, 1, 2])
-
-    observations = reset()
-    native = runtime.created[-1][2]
-    assert native.events[:3] == ['clear', ('reset', {}), ('reset', {})]
-    assert native.events[3:] == [('file', 'run_0.hdf5')] + [('index', i, {
-        'env_ids': [i]
-    }) for i in range(3)]
-    assert len({info['native_hdf5_path'] for _, info in observations}) == 1
-    assert [info['native_demo_key']
-            for _, info in observations] == ['demo_0', 'demo_1', 'demo_2']
-    for step in range(1, 7):
-        active = set(native.active_env_ids)
-        transitions = env.step_batch({i: np.ones(8) * i for i in active})
-        assert set(transitions) == active
-        if step > 3:
-            np.testing.assert_array_equal(native.actions[-1][0], np.zeros(8))
-    assert calls == [('demo_0', True, 3), ('demo_1', False, 5),
-                     ('demo_2', True, 6)]
-    with pytest.raises(RuntimeError, match='reset_batch'):
-        env.step_batch({})
-    second = reset()
-    assert len(runtime.created) == 1 and native.resets == 4
-    assert second[0][1]['instance_episode'] == 1
-    reset(1)
-    assert native.closed == 1 and len(runtime.created) == 2
-    native = runtime.created[-1][2]
-    native.finish_steps = [99, 99, 99]
-    for _ in range(5):
-        env.step_batch({i: np.zeros(8) for i in range(3)})
-    with pytest.raises(RuntimeError, match='outer-loop limit'):
-        env.step_batch({i: np.zeros(8) for i in range(3)})
-    env.close()
-
-
 def _reset(env, index=0, task=0):
     return env.reset(
         env.tasks()[task],
@@ -588,7 +479,7 @@ def test_activation_failure_closes_native_and_app(runtime, tmp_path):
     runtime.runtime.create_env = invalid
     env = RoboLabEnvironment(task_name='TaskA', output_dir=tmp_path)
     env.setup()
-    with pytest.raises(ValueError, match='batch_size'):
+    with pytest.raises(ValueError, match='num_envs'):
         _reset(env)
     assert runtime.created[0][2].closed == 1
     assert runtime.app_closed == 1
@@ -940,29 +831,37 @@ def test_internal_early_reset_never_extends_outer_budget(
         assert native.episode_length_buf[0] == 6 - artifact_step
 
 
-def test_native_batch_configuration_is_opt_in():
-    env = RoboLabEnvironment(task_name='all', num_envs=10)
-    assert env.batch_size == 10
-    assert RoboLabEnvironment(task_name='all').batch_size == 1
-    for invalid in (0, -1, True, 1.5):
-        with pytest.raises((ValueError, TypeError)):
-            RoboLabEnvironment(task_name='all', num_envs=invalid)
+@pytest.mark.parametrize('value', [True, False, 0, -1, 2, 10])
+def test_single_environment_rejected_before_runtime(value):
+    with pytest.raises((ValueError, TypeError), match='num_envs'):
+        RoboLabEnvironment(task_name='all', num_envs=value)
 
 
-def test_observations_select_the_requested_native_lane():
-    env = RoboLabEnvironment(task_name='all', num_envs=3)
-    env._instruction = 'Pick'
-    raw = dict(
-        image_obs={
-            key: np.stack([np.full((2, 3, 3), i, np.uint8) for i in range(3)])
-            for key in env.camera_keys.values()
-        },
-        proprio_obs=dict(
-            arm_joint_pos=np.arange(21).reshape(3, 7),
-            gripper_pos=np.array([[0], [0.5], [1]])))
-    obs = env._observation(raw, env_id=2)
-    assert obs['wrist_cam'][0, 0, 0] == 2
-    np.testing.assert_array_equal(obs['states'],
-                                  [14, 15, 16, 17, 18, 19, 20, 1])
-    obs['wrist_cam'][:] = 99
-    assert raw['image_obs']['wrist_cam'][2, 0, 0, 0] == 2
+def test_two_tasks_ten_scalar_episodes_keep_native_rules(environment, runtime):
+    outcomes = []
+    for task_index in range(2):
+        for episode in range(10):
+            _reset(environment, episode, task_index)
+            native = runtime.created[-1][2]
+            native.next_success = episode % 2 == 0
+            result = environment.step(np.zeros(8))
+            outcomes.append(result.success)
+            assert result.score == (1.0 if result.success else 0.5)
+    assert outcomes.count(True) == outcomes.count(False) == 10
+    assert len(runtime.launches) == 1
+    assert len(runtime.created) == 2
+    assert all(item[1]['num_envs'] == 1 for item in runtime.created)
+    assert [item[2].resets for item in runtime.created] == [20, 20]
+    assert len(runtime.metrics_calls) == 20
+    assert len({str(item[0]) for item in runtime.metrics_calls}) == 20
+
+
+def test_full_scalar_manifest_keeps_120_times_ten_jobs():
+    from fluxthemis.engines.runners.episode import build_episode_jobs
+    tasks = tuple(TaskSpec(f'task-{i}') for i in range(120))
+    jobs = build_episode_jobs(tasks, 10, 0, 'scalar-full')
+    assert len(jobs) == 1200
+    assert len({job.episode_id for job in jobs}) == 1200
+    assert all(
+        sum(job.task.task_id == task.task_id for job in jobs) == 10
+        for task in tasks)
