@@ -22,18 +22,19 @@ class ProcessTree:
     @staticmethod
     def snapshot(permission_errors=None):
         rows = {}
-        # Avoid glob's exists/stat checks while short-lived processes exit.
-        for name in os.listdir('/proc'):
-            if not name.isdigit():
+        # A nested glob stats each PID before yielding, outside the handler
+        # below. List only /proc itself so exiting processes cannot abort it.
+        for process in Path('/proc').iterdir():
+            if not process.name.isdigit():
                 continue
-            path = Path('/proc') / name / 'stat'
             try:
-                fields = path.read_text().rsplit(')', 1)[1].split()
+                text = (process / 'stat').read_text()
+                fields = text.rsplit(')', 1)[1].split()
                 if fields[0] == 'Z':
                     continue
                 # Parent PID, process group and start time (guards PID reuse).
-                rows[int(path.parent.name)] = (int(fields[1]), int(fields[2]),
-                                               int(fields[19]))
+                rows[int(process.name)] = (int(fields[1]), int(fields[2]),
+                                           int(fields[19]))
             except PermissionError as error:
                 if permission_errors is None:
                     raise
