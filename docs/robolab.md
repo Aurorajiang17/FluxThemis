@@ -70,6 +70,36 @@ monitoring and launcher overrides. Direct
 [distributed_eval.py](../scripts/distributed_eval.py) use requires
 --simulator-restart-limit 0 for RoboLab.
 
+### Camera presets
+
+Select an optional native camera preset in the environment configuration.
+In a Python config alongside droid.py, for example:
+
+```python
+_base_ = ['droid.py']
+themis = dict(
+    evaluation=dict(
+        environment=dict(
+            camera_preset='WRIST_LEFT_RIGHT_HEAD',
+            camera_keys=dict(
+                over_shoulder_left_camera='over_shoulder_left_camera',
+                over_shoulder_right_camera='over_shoulder_right_camera',
+                wrist_cam='wrist_cam'))),
+    transport=dict(image_keys=[
+        'over_shoulder_left_camera', 'over_shoulder_right_camera', 'wrist_cam'
+    ]))
+```
+
+camera_preset selects the cameras created during native registration.
+camera_keys selects and names the images returned by the environment;
+transport.image_keys must match the policy's requested views and order.
+Setting camera_keys alone does not create a missing camera.
+WRIST_LEFT_RIGHT_HEAD creates left, right, head and wrist cameras; this
+example sends only left, right and wrist images to the policy. Other native
+presets include WRIST_LEFT_RIGHT. Omitting camera_preset preserves native
+registration defaults. Unknown presets fail setup and close the application.
+The preset does not change action format, execution horizon or success rules.
+
 ## 3. Evaluation protocol and limitations
 
 Only num_envs=1 is supported. One Isaac application belongs to each worker.
@@ -81,7 +111,7 @@ Native instance_episode counts local reuse; it can differ from episode_index.
 Every episode resets native evaluation state and calls two native resets.
 The creation seed is retained; episode seed metadata does not reseed layouts.
 
-Observations contain RGB images under over_shoulder_left_camera and wrist_cam,
+By default, observations contain RGB images under over_shoulder_left_camera and wrist_cam,
 and states: seven joint positions followed by the gripper position.
 The prompt is the native task instruction. The model returns finite numeric
 [T,8] DROID joint-position actions; the shared client has no fixed chunk length.
@@ -97,9 +127,9 @@ Do not rerun normal failures or repair invalid actions.
 Single-environment request ordering requires new score measurements.
 Changing GPU count or task order also changes the sampling recipe and may
 change actions and scores. Keep these settings fixed when comparing models.
-The shared launcher requires a readable Linux /proc process table for all
-benchmarks. Permission failures remain errors after best-effort cleanup of
-owned processes; restricted process visibility cannot certify full cleanup.
+The shared launcher skips unreadable or vanished /proc/<pid>/stat entries.
+It cleans up owned processes and reports termination or reaping failures.
+Restricted process visibility can limit descendant tracking.
 
 ## 4. Results
 

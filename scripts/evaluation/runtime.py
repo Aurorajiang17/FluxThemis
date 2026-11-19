@@ -20,7 +20,7 @@ class ProcessTree:
             self.known[pid] = row[2]
 
     @staticmethod
-    def snapshot(permission_errors=None):
+    def snapshot():
         rows = {}
         # A nested glob stats each PID before yielding, outside the handler
         # below. List only /proc itself so exiting processes cannot abort it.
@@ -35,18 +35,12 @@ class ProcessTree:
                 # Parent PID, process group and start time (guards PID reuse).
                 rows[int(process.name)] = (int(fields[1]), int(fields[2]),
                                            int(fields[19]))
-            except PermissionError as error:
-                if permission_errors is None:
-                    raise
-                permission_errors.append(error)
             except (OSError, ValueError, IndexError):
                 continue
         return rows
 
-    def members(self, permission_errors=None):
-        rows = (
-            self.snapshot()
-            if permission_errors is None else self.snapshot(permission_errors))
+    def members(self):
+        rows = self.snapshot()
         owned = {
             pid
             for pid, started in self.known.items()
@@ -61,12 +55,9 @@ class ProcessTree:
         self.known = {pid: rows[pid][2] for pid in owned}
         return {pid: rows[pid] for pid in owned}
 
-    def signal_groups(self, signum, permission_errors=None):
+    def signal_groups(self, signum):
         # Only groups containing still-live, identity-checked descendants.
-        members = (
-            self.members()
-            if permission_errors is None else self.members(permission_errors))
-        for group in {row[1] for row in members.values()}:
+        for group in {row[1] for row in self.members().values()}:
             try:
                 os.killpg(group, signum)
             except ProcessLookupError:
@@ -189,22 +180,18 @@ class ProcessRunner:
                 return process.returncode
         finally:
             if process:
-                # Keep cleaning readable, identity-checked descendants even
-                # if an unrelated /proc entry is denied. Report that denial
-                # after cleanup; it cannot certify a complete process scan.
-                permission_errors = []
+                # torchrun workers have their own process groups/sessions.
                 try:
                     if tree is not None:
-                        tree.signal_groups(signal.SIGTERM, permission_errors)
+                        tree.signal_groups(signal.SIGTERM)
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
                             process.poll()
-                            if not tree.members(permission_errors):
+                            if not tree.members():
                                 break
                             time.sleep(.05)
                         else:
-                            tree.signal_groups(signal.SIGKILL,
-                                               permission_errors)
+                            tree.signal_groups(signal.SIGKILL)
                 finally:
                     # Popen owns this unreaped child and its new session.
                     # This also handles failure before ProcessTree exists.
@@ -221,5 +208,3 @@ class ProcessRunner:
                             except ProcessLookupError:
                                 pass
                     process.wait(timeout=5)
-                if permission_errors:
-                    raise permission_errors[0]

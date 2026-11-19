@@ -590,23 +590,22 @@ def test_installer_plan_and_invalid_options_do_not_write(installer, tmp_path):
     assert not calls()
 
 
-def test_proc_snapshot_tolerates_exit_but_preserves_permission_errors(
-        launch, monkeypatch):
+@pytest.mark.parametrize('error',
+                         [FileNotFoundError, PermissionError, OSError])
+def test_proc_snapshot_skips_unreadable_pid_and_keeps_readable_rows(
+        launch, monkeypatch, error):
     from evaluation.runtime import ProcessTree
-    monkeypatch.setattr('os.listdir', lambda path: ['123', 'not-a-pid'])
+    entries = [Path('/proc/123'), Path('/proc/124'), Path('/proc/not-a-pid')]
+    monkeypatch.setattr(Path, 'iterdir', lambda path: iter(entries))
 
-    def missing(path):
-        raise FileNotFoundError(path)
+    def read_stat(path):
+        if path == Path('/proc/123/stat'):
+            raise error('unreadable unrelated PID')
+        assert path == Path('/proc/124/stat')
+        return '124 (readable process) S 1 124 ' + '0 ' * 16 + '100'
 
-    monkeypatch.setattr(Path, 'read_text', missing)
-    assert ProcessTree.snapshot() == {}
-
-    def denied(path):
-        raise PermissionError(path)
-
-    monkeypatch.setattr(Path, 'read_text', denied)
-    with pytest.raises(PermissionError):
-        ProcessTree.snapshot()
+    monkeypatch.setattr(Path, 'read_text', read_stat)
+    assert ProcessTree.snapshot() == {124: (1, 124, 100)}
 
 
 def test_proc_members_does_not_adopt_reused_pid(launch, monkeypatch):
@@ -669,59 +668,140 @@ def test_existing_launch_plans_keep_shared_retry_and_timeout_defaults(
 
 
 @pytest.mark.parametrize('after_snapshot', [False, True])
-def test_proc_permission_failure_reaps_owned_process_and_preserves_error(
+def test_unreadable_unrelated_pid_does_not_fail_evaluation(
         launch, tmp_path, monkeypatch, after_snapshot):
+    import os
     import subprocess
     import sys
 
-    from evaluation.runtime import ProcessRunner, ProcessTree
+    from evaluation.runtime import ProcessRunner
 
-    runner = ProcessRunner(
-        dict(
-            local=dict(python=sys.executable, port=15558),
-            output=str(tmp_path)))
+    runner = ProcessRunner(dict(local=dict(python=sys.executable, port=15558)))
     processes = []
-    popen = subprocess.Popen
-    read_text = Path.read_text
+    popen, iterdir, read_text = subprocess.Popen, Path.iterdir, Path.read_text
+    unrelated = Path('/proc/999999999')
+    scans = denied_reads = 0
+    owned_reads = set()
 
     def capture(*args, **kwargs):
         process = popen(*args, **kwargs)
         processes.append(process)
         return process
 
-    def denied(path, *args, **kwargs):
-        if path.parts[:2] == ('/', 'proc'):
-            raise PermissionError('restricted process table')
+    def entries(path):
+        nonlocal scans
+        if path == Path('/proc'):
+            scans += 1
+            return iter([unrelated, *iterdir(path)])
+        return iterdir(path)
+
+    def read_stat(path, *args, **kwargs):
+        nonlocal denied_reads
+        if path == unrelated / 'stat':
+            if after_snapshot and scans == 1:
+                raise FileNotFoundError('PID absent during initialization')
+            denied_reads += 1
+            raise PermissionError('unreadable unrelated PID')
+        if processes and path == Path(f'/proc/{processes[0].pid}/stat'):
+            owned_reads.add(scans)
         return read_text(path, *args, **kwargs)
 
-    if after_snapshot:
-        # Deny one unrelated entry only after the initial complete snapshot.
-        snapshot = ProcessTree.snapshot
-        completed = False
-
-        def late_denial(permission_errors=None):
-            nonlocal completed
-            if completed:
-                if permission_errors is None:
-                    raise PermissionError('restricted process table')
-                permission_errors.append(
-                    PermissionError('restricted process table'))
-            completed = True
-            return snapshot()
-
-        monkeypatch.setattr(ProcessTree, 'snapshot', staticmethod(late_denial))
-    else:
-        monkeypatch.setattr(Path, 'read_text', denied)
     monkeypatch.setattr(subprocess, 'Popen', capture)
+    monkeypatch.setattr(Path, 'iterdir', entries)
+    monkeypatch.setattr(Path, 'read_text', read_stat)
     try:
-        with pytest.raises(PermissionError, match='restricted process table'):
-            runner.run_logged(
-                [sys.executable, '-c', 'import time; time.sleep(10)'],
-                tmp_path / 'permission.log', None, 2)
+        code = runner.run_logged(
+            [sys.executable, '-c', 'import time; time.sleep(.1)'],
+            tmp_path / 'permission.log',
+            None,
+            2,
+            tick=lambda: None)
+        assert code == 0
+        assert denied_reads > 0
+        assert len(owned_reads) >= 2
         assert len(processes) == 1
-        assert processes[0].poll() is not None
+        assert processes[0].returncode == 0
+        with pytest.raises(ChildProcessError):
+            os.waitpid(processes[0].pid, os.WNOHANG)
     finally:
         for process in processes:
             if process.poll() is None:
                 process.terminate()
             process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('stage', ['initialization', 'evaluation'])
+def test_run_failure_terminates_and_reaps_owned_child(launch, tmp_path,
+                                                      monkeypatch, stage):
+    import os
+    import subprocess
+    import sys
+
+    from evaluation.runtime import ProcessRunner, ProcessTree
+
+    runner = ProcessRunner(dict(local=dict(python=sys.executable, port=15558)))
+    processes = []
+    popen = subprocess.Popen
+
+    def capture(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def fail(*args):
+        raise RuntimeError(f'{stage} failed')
+
+    monkeypatch.setattr(subprocess, 'Popen', capture)
+    if stage == 'initialization':
+        monkeypatch.setattr(ProcessTree, '__init__', fail)
+    try:
+        with pytest.raises(RuntimeError, match=f'{stage} failed'):
+            runner.run_logged(
+                [sys.executable, '-c', 'import time; time.sleep(10)'],
+                tmp_path / 'failure.log',
+                None,
+                2,
+                tick=fail)
+        assert len(processes) == 1
+        assert processes[0].returncode is not None
+        assert processes[0].returncode != 0
+        with pytest.raises(ChildProcessError):
+            os.waitpid(processes[0].pid, os.WNOHANG)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('stage', ['termination', 'reaping'])
+def test_owned_child_cleanup_errors_remain_visible(launch, tmp_path,
+                                                   monkeypatch, stage):
+    import signal
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    from evaluation.runtime import ProcessRunner, ProcessTree
+
+    runner = ProcessRunner(dict(local=dict(python=sys.executable, port=15558)))
+    signals = []
+
+    def fail(*args):
+        raise RuntimeError('initialization failed')
+
+    def terminate(pid, signum):
+        signals.append((pid, signum))
+        if stage == 'termination':
+            raise PermissionError('owned child termination failed')
+
+    def wait(timeout):
+        raise OSError('owned child reaping failed')
+
+    process = SimpleNamespace(pid=123, poll=lambda: None, wait=wait)
+    monkeypatch.setattr(subprocess, 'Popen', lambda *args, **kwargs: process)
+    monkeypatch.setattr(ProcessTree, '__init__', fail)
+    monkeypatch.setattr('os.killpg', terminate)
+    with pytest.raises(OSError, match=f'owned child {stage} failed'):
+        runner.run_logged(['unused'], tmp_path / 'cleanup.log', None, 2)
+    assert signals == [(123, signal.SIGTERM)]

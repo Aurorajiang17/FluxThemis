@@ -17,6 +17,44 @@ from fluxthemis.environments.sim.robolab import RoboLabEnvironment
 from fluxthemis.structures import TaskSpec
 
 
+@pytest.mark.parametrize('preset', [None, 'WRIST_LEFT_RIGHT_HEAD'])
+def test_camera_preset_reaches_native_registration(runtime, tmp_path,
+                                                   monkeypatch, preset):
+    presets = ModuleType('robolab.registrations.droid.camera_presets')
+    cameras = [object(), object(), object(), object()]
+    presets.WRIST_LEFT_RIGHT_HEAD = cameras
+    monkeypatch.setitem(sys.modules, presets.__name__, presets)
+    env = RoboLabEnvironment(
+        'TaskA', output_dir=tmp_path, camera_preset=preset)
+    try:
+        env.setup()
+        registration = runtime.registrations[-1]
+        if preset is None:
+            assert 'cameras' not in registration
+        else:
+            assert registration['cameras'] is cameras
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize('preset', ['', 'wrist', '../WRIST', 1, True])
+def test_camera_preset_validation_precedes_kit(preset):
+    with pytest.raises(ValueError, match='camera_preset'):
+        RoboLabEnvironment('TaskA', camera_preset=preset)
+
+
+def test_unknown_native_camera_preset_stops_registration(
+        runtime, tmp_path, monkeypatch):
+    presets = ModuleType('robolab.registrations.droid.camera_presets')
+    monkeypatch.setitem(sys.modules, presets.__name__, presets)
+    env = RoboLabEnvironment(
+        'TaskA', output_dir=tmp_path, camera_preset='UNKNOWN')
+    with pytest.raises(ValueError, match='Unknown native camera_preset'):
+        env.setup()
+    assert runtime.registrations == []
+    assert runtime.app_closed == 1
+
+
 @pytest.mark.parametrize('token,visible,expected_cuda',
                          [('2', '2', 0), ('GPU-bb', 'GPU-bb', 0),
                           ('2', '5,2', 1), ('GPU-bb', 'GPU-cc,GPU-bb', 1)])

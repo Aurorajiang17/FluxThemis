@@ -163,7 +163,8 @@ class RoboLabEnvironment(BaseEnvironment):
                  renderer: str = 'realtime',
                  rendering_mode: str | None = None,
                  render_device_map: Mapping[str, int] | None = None,
-                 kit_cache_root: str | os.PathLike | None = None) -> None:
+                 kit_cache_root: str | os.PathLike | None = None,
+                 camera_preset: str | None = None) -> None:
         names = [task_name] if isinstance(task_name, str) else list(task_name)
         if not names or any(not isinstance(n, str) or not n.strip()
                             for n in names):
@@ -224,6 +225,12 @@ class RoboLabEnvironment(BaseEnvironment):
             raise TypeError('headless must be a boolean')
         self.headless = headless
         self.robolab_root = robolab_root
+        if camera_preset is not None and (
+                not isinstance(camera_preset, str)
+                or re.fullmatch(r'[A-Z][A-Z0-9_]*', camera_preset) is None):
+            raise ValueError(
+                'camera_preset must name a native uppercase preset')
+        self.camera_preset = camera_preset
         self.output_dir = Path(output_dir).expanduser()
         self.camera_keys = dict(
             camera_keys if camera_keys is not None else {
@@ -364,10 +371,20 @@ class RoboLabEnvironment(BaseEnvironment):
             runtime = _load_postlaunch_runtime()
             selection = (None if self.task_names == ('all', ) else list(
                 self.task_names))
+            camera_options = {}
+            if self.camera_preset is not None:
+                presets = importlib.import_module(
+                    'robolab.registrations.droid.camera_presets')
+                cameras = getattr(presets, self.camera_preset, None)
+                if not isinstance(cameras, (list, tuple)) or not cameras:
+                    raise ValueError(
+                        f'Unknown native camera_preset: {self.camera_preset}')
+                camera_options['cameras'] = cameras
             runtime.register(
                 task_dirs=['benchmark'],
                 task=selection,
-                randomize_background=False)
+                randomize_background=False,
+                **camera_options)
             factory = runtime.factory.get_global_env_factory()
             tasks = []
             for name in runtime.factory.get_envs(task=selection):
